@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8" />
+    <title>E‑Commerce Backoffice</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+            integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+            crossorigin="anonymous"
+    />
+    <style>
+        body { background-color: #f5f5f7; }
+        .navbar-brand { font-weight: 600; letter-spacing: 0.03em; }
+        .card { border-radius: 14px; border: none; box-shadow: 0 10px 30px rgba(15,23,42,0.06); }
+        .form-label { font-weight: 500; }
+        .table thead th { background-color: #f1f5f9; border-bottom: none; }
+        .badge-pill { border-radius: 999px; }
+    </style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-light bg-white border-bottom">
+    <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">E‑Commerce Backoffice</span>
+    </div>
+</nav>
+
+<main class="container my-4">
+    <ul class="nav nav-tabs mb-3" id="mainTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="products-tab" data-bs-toggle="tab" data-bs-target="#products-pane"
+                    type="button" role="tab">
+                Prodotti
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="suppliers-tab" data-bs-toggle="tab" data-bs-target="#suppliers-pane"
+                    type="button" role="tab">
+                Fornitori
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="import-tab" data-bs-toggle="tab" data-bs-target="#import-pane"
+                    type="button" role="tab">
+                Import / Export
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content">
+        <!-- PRODOTTI -->
+        <div class="tab-pane fade show active" id="products-pane" role="tabpanel" aria-labelledby="products-tab">
+            <div class="row g-4">
+                <div class="col-lg-8">
+                    <div class="card">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-center mb-3">
+                                <h5 class="card-title mb-0">Catalogo prodotti</h5>
+                                <button class="btn btn-outline-secondary btn-sm" id="refresh-products-btn">
+                                    Aggiorna
+                                </button>
+                            </div>
+                            <form id="product-filters-form" class="row g-2 mb-3">
+                                <div class="col-md-4">
+                                    <label class="form-label" for="filter-sku">SKU</label>
+                                    <input id="filter-sku" type="text" class="form-control" placeholder="Es. SKU123" />
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label" for="filter-nome">Nome</label>
+                                    <input id="filter-nome" type="text" class="form-control" placeholder="Nome prodotto" />
+                                </div>
+                                <div class="col-md-4">
+                                    <label class="form-label" for="filter-categoria">Categoria</label>
+                                    <input id="filter-categoria" type="text" class="form-control" placeholder="Categoria" />
+                                </div>
+                                <div class="col-12 d-flex justify-content-end gap-2 mt-1">
+                                    <button type="button" class="btn btn-outline-secondary btn-sm" id="clear-product-filters-btn">
+                                        Pulisci filtri
+                                    </button>
+                                    <button type="submit" class="btn btn-primary btn-sm">
+                                        Cerca
+                                    </button>
+                                </div>
+                            </form>
+                            <div class="table-responsive">
+                                <table class="table align-middle mb-0">
+                                    <thead>
+                                    <tr>
+                                        <th>SKU</th>
+                                        <th>Nome</th>
+                                        <th>Categoria</th>
+                                        <th class="text-end">Prezzo base</th>
+                                        <th class="text-end">Prezzo finale</th>
+                                        <th class="text-end">Aumento %</th>
+                                        <th style="width: 1%; white-space: nowrap;">Azioni</th>
+                                    </tr>
+                                    </thead>
+                                    <tbody id="products-tbody">
+                                    <tr>
+                                        <td colspan="7" class="text-muted text-center py-4">
+                                            Nessun prodotto caricato.
+                                        </td>
+                                    </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="col-lg-4">
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3" id="product-form-title">Nuovo prodotto</h5>
+                            <form id="product-form">
+                                <input type="hidden" id="product-id" />
+                                <div class="mb-2">
+                                    <label class="form-label" for="product-sku">SKU *</label>
+                                    <input id="product-sku" type="text" required class="form-control" />
+                                </div>
+                                <div class="mb-2">
+                                    <label class="form-label" for="product-name">Nome *</label>
+                                    <input id="product-name" type="text" required class="form-control" />
+                                </div>
+                                <div class="mb-2">
+                                    <label class="form-label" for="product-desc">Descrizione</label>
+                                    <textarea id="product-desc" rows="2" class="form-control"></textarea>
+                                </div>
+                                <div class="row g-2 mb-2">
+                                    <div class="col-6">
+                                        <label class="form-label" for="product-prezzo-base">Prezzo base *</label>
+                                        <input id="product-prezzo-base" type="number" step="0.01" min="0"
+                                               class="form-control" required />
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="form-label" for="product-prezzo-finale">Prezzo finale *</label>
+                                        <input id="product-prezzo-finale" type="number" step="0.01" min="0"
+                                               class="form-control" required />
+                                    </div>
+                                </div>
+                                <div class="mb-2">
+                                    <label class="form-label" for="product-aumento-percentuale">
+                                        Aumento % (opzionale)
+                                    </label>
+                                    <input id="product-aumento-percentuale" type="number" step="0.01" class="form-control" />
+                                </div>
+                                <div class="mb-2">
+                                    <label class="form-label" for="product-category">Categoria (sola lettura)</label>
+                                    <input id="product-category" type="text" class="form-control" readonly
+                                           placeholder="Impostata da import o back end" />
+                                </div>
+                                <div class="d-grid gap-2 mt-3">
+                                    <button type="submit" class="btn btn-primary" id="product-save-btn">
+                                        Salva prodotto
+                                    </button>
+                                    <button type="button" class="btn btn-outline-secondary" id="product-reset-btn">
+                                        Nuovo prodotto
+                                    </button>
+                                </div>
+                                <div class="small text-muted mt-2">
+                                    La categoria viene mantenuta come impostata via import o back end.
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FORNITORI -->
+        <div class="tab-pane fade" id="suppliers-pane" role="tabpanel" aria-labelledby="suppliers-tab">
+            <div class="row g-4">
+                <div class="col-lg-4">
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3">Nuovo fornitore</h5>
+                            <form id="supplier-form">
+                                <div class="mb-3">
+                                    <label class="form-label" for="supplier-name">Nome *</label>
+                                    <input id="supplier-name" name="nome" type="text" required class="form-control"
+                                           placeholder="Es. Fornitore Rossi" />
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="supplier-code">Codice</label>
+                                    <input id="supplier-code" name="codice" type="text" class="form-control"
+                                           placeholder="Es. FR001" />
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="supplier-email">Email</label>
+                                    <input id="supplier-email" name="email" type="email" class="form-control"
+                                           placeholder="contatto@fornitore.it" />
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="supplier-phone">Telefono</label>
+                                    <input id="supplier-phone" name="telefono" type="text" class="form-control"
+                                           placeholder="+39 ..." />
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="supplier-notes">Note</label>
+                                    <textarea id="supplier-notes" name="note" rows="2" class="form-control"
+                                              placeholder="Informazioni aggiuntive..."></textarea>
+                                </div>
+                                <div class="d-grid gap-2">
+                                    <button type="submit" class="btn btn-primary">Salva fornitore</button>
+                                </div>
+                                <div class="small text-muted mt-2">
+                                    Dopo aver creato il fornitore potrai caricare i suoi CSV dalla tab “Import prodotti”.
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-lg-8">
+                    <div class="card">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-center mb-3">
+                                <h5 class="card-title mb-0">Elenco fornitori</h5>
+                                <button class="btn btn-outline-secondary btn-sm" id="refresh-suppliers-btn">
+                                    Aggiorna
+                                </button>
+                            </div>
+                            <div class="table-responsive">
+                                <table class="table align-middle mb-0">
+                                    <thead>
+                                    <tr>
+                                        <th>Nome</th>
+                                        <th>Codice</th>
+                                        <th>Contatti</th>
+                                        <th style="width: 1%; white-space: nowrap;">Azioni</th>
+                                    </tr>
+                                    </thead>
+                                    <tbody id="suppliers-tbody">
+                                    <tr>
+                                        <td colspan="4" class="text-muted text-center py-4">
+                                            Nessun fornitore caricato.
+                                        </td>
+                                    </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- IMPORT / EXPORT -->
+        <div class="tab-pane fade" id="import-pane" role="tabpanel" aria-labelledby="import-tab">
+            <div class="row g-4">
+                <div class="col-lg-6">
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3">Carica CSV prodotti</h5>
+                            <form id="import-form">
+                                <div class="mb-3">
+                                    <label class="form-label" for="import-supplier-select">
+                                        Fornitore (opzionale, solo a scopo informativo per ora)
+                                    </label>
+                                    <select id="import-supplier-select" class="form-select">
+                                        <option value="">Seleziona fornitore</option>
+                                    </select>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="products-file">File CSV prodotti *</label>
+                                    <input id="products-file" name="file" type="file" accept=".csv"
+                                           class="form-control" required />
+                                    <div class="form-text">
+                                        Colonne attese secondo <code>ProductImportDTO</code> (es. <code>sku, nome, prezzoBase, nomeCategoria</code>).
+                                    </div>
+                                </div>
+                                <div class="d-grid gap-2">
+                                    <button type="submit" class="btn btn-success">Importa prodotti</button>
+                                </div>
+                            </form>
+
+                            <hr class="my-4" />
+
+                            <h5 class="card-title mb-3">Carica CSV documenti</h5>
+                            <form id="documents-import-form">
+                                <div class="mb-3">
+                                    <label class="form-label" for="documents-file">File CSV documenti *</label>
+                                    <input id="documents-file" name="file" type="file" accept=".csv"
+                                           class="form-control" required />
+                                    <div class="form-text">
+                                        Colonne attese secondo <code>DocumentImportDTO</code> (es. <code>sku, tipoDocumento, urlDocumento</code>).
+                                    </div>
+                                </div>
+                                <div class="d-grid gap-2">
+                                    <button type="submit" class="btn btn-success">Importa documenti</button>
+                                </div>
+                            </form>
+
+                            <div class="alert alert-info mt-3 mb-0 small">
+                                Gli import utilizzano gli endpoint <code>/api/import/products</code> e <code>/api/import/documents</code>.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-lg-6">
+                    <div class="card h-100">
+                        <div class="card-body">
+                            <h5 class="card-title mb-3">Stato operazioni</h5>
+                            <div id="status-area" class="small text-muted mb-3">
+                                Nessuna operazione in corso.
+                            </div>
+
+                            <h6 class="card-subtitle mb-2">Export catalogo prodotti</h6>
+                            <p class="small text-muted">
+                                Esporta il catalogo corrente utilizzando gli endpoint del back end.
+                            </p>
+                            <div class="d-grid gap-2 d-md-block">
+                                <button id="export-csv-btn" class="btn btn-outline-primary btn-sm">
+                                    Scarica CSV
+                                </button>
+                                <button id="export-json-btn" class="btn btn-outline-secondary btn-sm">
+                                    Scarica JSON
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+        crossorigin="anonymous"></script>
+<script src="app.js"></script>
+</body>
+</html>
+
