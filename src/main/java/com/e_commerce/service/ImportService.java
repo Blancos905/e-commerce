@@ -2,7 +2,10 @@ package com.e_commerce.service;
 
 import com.e_commerce.dto.DocumentImportDTO;
 import com.e_commerce.dto.ProductImportDTO;
+import com.e_commerce.dto.ProductSnapshotDTO;
 import com.e_commerce.dto.SupplierImportDTO;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.e_commerce.model.Category;
 import com.e_commerce.model.Document;
 import com.e_commerce.model.ImportLog;
@@ -47,6 +50,9 @@ import org.w3c.dom.NodeList;
 
 @Service
 public class ImportService {
+
+    /** Indice colonna Excel CS (97ª colonna, 0-based=96), usata spesso per disponibilità. */
+    private static final int COLONNA_CS_INDEX = 96;
 
     private final ProductRepository productRepository;
     private final CategoryRepository categoryRepository;
@@ -93,6 +99,152 @@ public class ImportService {
         );
     }
 
+    /**
+     * Applica l'import al catalogo salvando uno snapshot dello stato precedente.
+     * Permette il rollback senza resettare tutto il catalogo.
+     */
+    public void applyImportWithSnapshot(ImportLog log) throws Exception {
+        if (log == null || log.getFileContent() == null || log.getFileContent().length == 0) {
+            throw new IllegalArgumentException("File non disponibile nello storico import.");
+        }
+        if (log.getSupplier() == null) {
+            throw new IllegalArgumentException("Import senza fornitore associato.");
+        }
+        List<ProductImportDTO> rows = parseProductRowsFromBytes(
+                log.getFileContent(),
+                log.getFileName(),
+                log.getFileContentType()
+        );
+        Map<String, ProductSnapshotDTO> snapshot = new HashMap<>();
+        for (ProductImportDTO dto : rows) {
+            String sku = normalize(dto.getSku());
+            if (sku == null) continue;
+            String skuTruncated = truncate(sku, 255);
+            productRepository.findBySku(skuTruncated).ifPresent(p -> snapshot.put(skuTruncated, toSnapshot(p)));
+        }
+        processProductRows(rows, log.getSupplier());
+        ObjectMapper mapper = new ObjectMapper();
+        log.setPreviousStateJson(mapper.writeValueAsString(snapshot));
+        log.setAppliedAt(LocalDateTime.now());
+        importLogRepository.save(log);
+    }
+
+    /**
+     * Annulla l'ultimo import: ripristina i prodotti modificati ed elimina quelli creati.
+     */
+    public void rollbackImport(ImportLog log) throws Exception {
+        if (log == null || log.getPreviousStateJson() == null || log.getPreviousStateJson().isBlank()) {
+            throw new IllegalArgumentException("Impossibile fare rollback: nessuno snapshot disponibile per questo import.");
+        }
+        List<ProductImportDTO> rows = parseProductRowsFromBytes(
+                log.getFileContent(),
+                log.getFileName(),
+                log.getFileContentType()
+        );
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, ProductSnapshotDTO> snapshot = mapper.readValue(
+                log.getPreviousStateJson(),
+                new TypeReference<Map<String, ProductSnapshotDTO>>() {}
+        );
+        for (ProductImportDTO dto : rows) {
+            String sku = normalize(dto.getSku());
+            if (sku == null) continue;
+            String skuTruncated = truncate(sku, 255);
+            ProductSnapshotDTO snap = snapshot.get(skuTruncated);
+            if (snap != null) {
+                restoreFromSnapshot(snap);
+            } else {
+                productRepository.findBySku(skuTruncated).ifPresent(p -> productService.deleteById(p.getId()));
+            }
+        }
+        importLogRepository.delete(log);
+    }
+
+    private ProductSnapshotDTO toSnapshot(Product p) {
+        ProductSnapshotDTO dto = new ProductSnapshotDTO();
+        dto.setId(p.getId());
+        dto.setSku(p.getSku());
+        dto.setEan(p.getEan());
+        dto.setNome(p.getNome());
+        dto.setDescrizione(p.getDescrizione());
+        dto.setPrezzoBase(p.getPrezzoBase());
+        dto.setPrezzoFinale(p.getPrezzoFinale());
+        dto.setAumentoPercentuale(p.getAumentoPercentuale());
+        dto.setCategoriaId(p.getCategoria() != null ? p.getCategoria().getId() : null);
+        dto.setSupplierId(p.getFornitore() != null ? p.getFornitore().getId() : null);
+        dto.setContati(p.getContati());
+        dto.setDisponibilita(p.getDisponibilita());
+        return dto;
+    }
+
+    private void restoreFromSnapshot(ProductSnapshotDTO snap) {
+        Product product = productRepository.findById(snap.getId()).orElse(null);
+        if (product == null) return;
+        product.setEan(snap.getEan());
+        product.setNome(snap.getNome());
+        product.setDescrizione(snap.getDescrizione());
+        product.setPrezzoBase(snap.getPrezzoBase());
+        product.setPrezzoFinale(snap.getPrezzoFinale());
+        product.setAumentoPercentuale(snap.getAumentoPercentuale());
+        product.setContati(snap.getContati());
+        product.setDisponibilita(snap.getDisponibilita());
+        if (snap.getCategoriaId() != null) {
+            categoryRepository.findById(snap.getCategoriaId()).ifPresent(product::setCategoria);
+        } else {
+            product.setCategoria(null);
+        }
+        if (snap.getSupplierId() != null) {
+            supplierRepository.findById(snap.getSupplierId()).ifPresent(product::setFornitore);
+        } else {
+            product.setFornitore(null);
+        }
+        productService.save(product);
+    }
+
+    private List<ProductImportDTO> parseProductRowsFromBytes(byte[] bytes, String filename, String contentType) throws Exception {
+        if (isExcelFile(filename, contentType)) {
+            return parseProductsXlsxOrXlsBytes(bytes, "Prodotti (Excel): header atteso almeno: sku,nome_prodotto,categoria,prezzo.");
+        }
+        if (isExcelXmlFile(filename, contentType)) {
+            return parseProductsSpreadsheetMlBytes(bytes, "Prodotti (Excel XML): header atteso almeno: sku,nome_prodotto,categoria,prezzo.");
+        }
+        return parseCsvBytes(bytes, ProductImportDTO.class, "Prodotti (CSV): header atteso almeno: sku,nome_prodotto,categoria.");
+    }
+
+    private void processProductRows(List<ProductImportDTO> rows, Supplier supplier) throws Exception {
+        for (ProductImportDTO dto : rows) {
+            String sku = normalize(dto.getSku());
+            if (sku == null) continue;
+            sku = truncate(sku, 255);
+            String nomeProdotto = normalize(dto.getNome());
+            if (nomeProdotto == null) nomeProdotto = sku;
+            nomeProdotto = truncate(nomeProdotto, 255);
+            String rawNomeCategoria = normalize(dto.getNomeCategoria());
+            String nomeCategoria;
+            if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
+                    && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
+                nomeCategoria = rawNomeCategoria;
+            } else {
+                String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
+                nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+            }
+            Category category = categoryRepository.findByNome(nomeCategoria)
+                    .orElseGet(() -> {
+                        Category c = new Category();
+                        c.setNome(nomeCategoria);
+                        return categoryRepository.save(c);
+                    });
+            Product product = productRepository.findBySku(sku).orElseGet(Product::new);
+            product.setSku(sku);
+            product.setNome(nomeProdotto);
+            product.setPrezzoBase(dto.getPrezzoBase() != null ? BigDecimal.valueOf(dto.getPrezzoBase()) : BigDecimal.ZERO);
+            product.setCategoria(category);
+            product.setFornitore(supplier);
+            product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
+            productService.save(product);
+        }
+    }
+
     private void importProductsFromBytes(byte[] bytes,
                                         String originalFilename,
                                         String contentType,
@@ -117,6 +269,9 @@ public class ImportService {
         for (ProductImportDTO dto : rows) {
             String sku = normalize(dto.getSku());
             if (sku == null) {
+                sku = normalize(dto.getEan()); // fallback: EAN come SKU (molti fornitori usano EAN come codice)
+            }
+            if (sku == null) {
                 rowNumber++;
                 continue; // salta righe senza SKU (righe vuote o dati incompleti)
             }
@@ -132,13 +287,16 @@ public class ImportService {
             nomeProdotto = truncate(nomeProdotto, 255);
 
             String rawNomeCategoria = normalize(dto.getNomeCategoria());
-            // Mappiamo la categoria originale del CSV + il nome prodotto
-            // su una delle macro-categorie del catalogo.
-            String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
-            final String nomeCategoria = mappedCategoria != null
-                    ? mappedCategoria
-                    // fallback per evitare errori DB su Category.nome NOT NULL
-                    : "Senza categoria";
+            // Se la categoria del CSV esiste già nel DB (anche creata dall'utente), usala direttamente.
+            // Altrimenti mappiamo tramite keyword su macro-categorie standard.
+            String nomeCategoria;
+            if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
+                    && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
+                nomeCategoria = rawNomeCategoria;
+            } else {
+                String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
+                nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+            }
 
             Category category = categoryRepository
                     .findByNome(nomeCategoria)
@@ -166,6 +324,12 @@ public class ImportService {
             if (supplier != null) {
                 product.setFornitore(supplier);
             }
+
+            product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
+
+            // EAN per Icecat: usa colonna ean se presente, altrimenti sku (molti fornitori usano EAN come codice)
+            String eanVal = normalize(dto.getEan());
+            product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
 
             productService.save(product);
             rowNumber++;
@@ -388,7 +552,7 @@ public class ImportService {
                 col = col.substring(1, col.length() - 1);
             }
             col = col.trim().toLowerCase();
-            col = col.replace(' ', '_');
+            col = col.replaceAll("\\s+", "_");
             col = aliasHeader(col);
             normalized.append(col);
             if (i < cols.length - 1) {
@@ -426,11 +590,20 @@ public class ImportService {
 
     private String aliasHeader(String col) {
         if (col == null) return null;
+        col = col.replaceAll("\\p{M}", "");
+        if (col.equals("cs") || col.matches("cs[_(\\(\\-].*")) {
+            return "disponibilita";
+        }
+        if (col.contains("disponibil") || col.contains("stock") || col.contains("giacenza") || col.contains("availability")) {
+            return "disponibilita";
+        }
         return switch (col) {
             // sku
             case "codice", "code", "product_code", "productcode", "sku_prodotto",
                     "codice_articolo", "codicearticolo", "art_code", "item_code",
-                    "ean", "barcode", "cod_articolo", "cod_art", "articolo_cod", "ref", "reference" -> "sku";
+                    "barcode", "cod_articolo", "cod_art", "articolo_cod", "ref", "reference" -> "sku";
+            // ean (per Icecat)
+            case "ean", "gtin", "ean13", "ean_upc" -> "ean";
 
             // prodotti - nome
             case "nome" -> "nome_prodotto";
@@ -438,13 +611,23 @@ public class ImportService {
                     "desc", "titolo", "title", "denominazione" -> "nome_prodotto";
             case "name", "product_name", "productname", "product", "description", "item_name" -> "nome_prodotto";
 
-            // prodotti - prezzo
+            // prodotti - prezzo (CON/contanti/contati = prezzo in contanti dal fornitore -> prezzo base)
             case "prezzo_base", "prezzo_listino", "prezzobase", "prezzo_di_listino",
-                    "price", "prezzo_unitario", "prezzo_unit", "listino" -> "prezzo";
+                    "price", "prezzo_unitario", "prezzo_unit", "listino",
+                    "prezzo_netto", "prezzonetto", "prezzo_vendita", "prezzo_vendita_netto",
+                    "pv", "p.v.", "p_v", "costo", "prezzo_acq", "prezzo_acquisto",
+                    "eur", "euro", "prezzo_eur", "contanti", "contati", "con" -> "prezzo";
 
             // prodotti - categoria
             case "category", "cat", "nome_categoria", "categoria_nome", "categories", "category_name",
                     "categoria_prodotto", "macrocategoria", "tipologia", "famiglia" -> "categoria";
+
+            // prodotti - disponibilità (stessa logica del prezzo: molti alias per file diversi)
+            case "cs", "c.s.", "c_s", "c.s", "cs.", "cs_cosenza", "cs_(cosenza)", "cs_(c)",
+                    "disponibilita", "disponibilità", "disp", "disponibilità_cs", "disponibilita_cs",
+                    "disponibilità_(cs)", "disp_cs", "cs_disp", "stock_cs", "giacenza", "availability",
+                    "disponibile", "quantità", "quantita", "qty", "stock", "stock_disponibile",
+                    "qtà", "quantità_disponibile", "pezzi", "magazzino", "in_stock" -> "disponibilita";
 
             // documenti
             case "tipo", "tipo_doc", "tipodocumento" -> "tipo_documento";
@@ -474,7 +657,7 @@ public class ImportService {
         String name = originalFilename != null ? originalFilename.toLowerCase() : "";
         String ct = contentType != null ? contentType.toLowerCase() : "";
         if (name.endsWith(".xml")) return false; // .xml -> Excel XML parser
-        if (name.endsWith(".xlsx") || name.endsWith(".xls")) return true;
+        if (name.endsWith(".xlsx") || name.endsWith(".xls") || name.endsWith(".xsl")) return true;
         if (ct.contains("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) return true;
         return ct.contains("application/vnd.ms-excel");
     }
@@ -507,22 +690,49 @@ public class ImportService {
                 Row headerRow = null;
                 Map<String, Integer> headerToIndex = new HashMap<>();
 
+                int bestScore = 0;
+                boolean usedSubHeader = false;
                 for (int r = firstRowNum; r <= lastRowNum; r++) {
                     Row row = sheet.getRow(r);
                     if (row == null) continue;
-                    headerToIndex.clear();
-                    for (Cell cell : row) {
+                    Map<String, Integer> candidate = new HashMap<>();
+                    int lastCellNum = row.getLastCellNum();
+                    for (int c = 0; c < lastCellNum; c++) {
+                        Cell cell = row.getCell(c);
+                        if (cell == null) continue;
                         String raw = formatter.formatCellValue(cell);
                         String col = normalizeExcelHeaderCell(raw);
                         if (col != null && !col.isBlank()) {
-                            headerToIndex.put(col, cell.getColumnIndex());
+                            candidate.put(col, c);
                         }
                     }
-                    Integer skuIdx = headerToIndex.get("sku");
-                    Integer catIdx = headerToIndex.get("categoria");
-                    if (skuIdx != null && catIdx != null) {
+                    // Unisce colonne dalla riga sotto (header su 2 righe: es. riga1=Category,Codice,CON, riga2=SA,CE,FG,CS)
+                    Row nextRow = sheet.getRow(r + 1);
+                    if (nextRow != null) {
+                        for (int c = 0; c < nextRow.getLastCellNum(); c++) {
+                            Cell cell = nextRow.getCell(c);
+                            if (cell == null) continue;
+                            String raw = formatter.formatCellValue(cell);
+                            String col = normalizeExcelHeaderCell(raw);
+                            if (col != null && !col.isBlank() && !candidate.containsKey(col)) {
+                                candidate.put(col, c);
+                            }
+                        }
+                    }
+                    Integer skuIdx = candidate.get("sku");
+                    Integer catIdx = candidate.get("categoria");
+                    if (skuIdx == null || catIdx == null) continue;
+                    int score = 1;
+                    if (candidate.containsKey("nome_prodotto")) score++;
+                    if (candidate.containsKey("prezzo")) score++;
+                    if (candidate.containsKey("disponibilita")) score++;
+                    if (score > bestScore) {
+                        bestScore = score;
                         headerRow = row;
-                        break;
+                        headerToIndex.clear();
+                        headerToIndex.putAll(candidate);
+                        Integer dispIdx = candidate.get("disponibilita");
+                        usedSubHeader = dispIdx != null && dispIdx >= row.getLastCellNum();
                     }
                 }
 
@@ -547,31 +757,85 @@ public class ImportService {
                 Integer nomeIdx = headerToIndex.get("nome_prodotto");
                 Integer catIdx = headerToIndex.get("categoria");
                 Integer prezzoIdx = headerToIndex.get("prezzo");
+                Integer disponibilitaIdx = headerToIndex.get("disponibilita");
+                Integer eanIdx = headerToIndex.get("ean");
+                int firstDataRow = headerRow.getRowNum() + (usedSubHeader ? 2 : 1);
+                if (disponibilitaIdx == null) {
+                    // Cerca nella riga header e nella riga successiva (header su 2 righe)
+                    Row subHeaderRow = sheet.getRow(headerRow.getRowNum() + 1);
+                    for (Row rowToScan : new Row[]{headerRow, subHeaderRow}) {
+                        if (rowToScan == null) continue;
+                        for (int c = 0; c < rowToScan.getLastCellNum(); c++) {
+                            Cell cell = rowToScan.getCell(c);
+                            if (cell == null) continue;
+                            String raw = formatter.formatCellValue(cell);
+                            if (raw == null) continue;
+                            String rawNorm = raw.trim().replaceAll("[\\s\\u00A0._-]+", "").replaceAll("\\p{M}", "");
+                            String col = normalizeExcelHeaderCell(raw);
+                            if ((col != null && col.equals("disponibilita")) || rawNorm.equalsIgnoreCase("cs")) {
+                                disponibilitaIdx = c;
+                                if (rowToScan == subHeaderRow) {
+                                    firstDataRow = headerRow.getRowNum() + 2;
+                                }
+                                break;
+                            }
+                        }
+                        if (disponibilitaIdx != null) break;
+                    }
+                    // Fallback: scansiona le prime 25 righe per trovare una cella "CS" (o C.S., C S, ecc.)
+                    if (disponibilitaIdx == null) {
+                        for (int rr = firstRowNum; rr <= Math.min(firstRowNum + 24, sheet.getLastRowNum()); rr++) {
+                            Row r = sheet.getRow(rr);
+                            if (r == null) continue;
+                            for (int c = 0; c < r.getLastCellNum(); c++) {
+                                Cell cell = r.getCell(c);
+                                if (cell == null) continue;
+                                String raw = formatter.formatCellValue(cell);
+                                if (raw == null) continue;
+                                String norm = raw.trim().replaceAll("[\\s\\u00A0._-]+", "").replaceAll("\\p{M}", "");
+                                if (norm.equalsIgnoreCase("cs")) {
+                                    disponibilitaIdx = c;
+                                    if (rr > headerRow.getRowNum()) {
+                                        firstDataRow = rr + 1;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (disponibilitaIdx != null) break;
+                        }
+                    }
+                    if (disponibilitaIdx == null) {
+                        disponibilitaIdx = COLONNA_CS_INDEX;
+                    }
+                }
 
-                int firstDataRow = headerRow.getRowNum() + 1;
                 int lastRow = sheet.getLastRowNum();
                 java.util.ArrayList<ProductImportDTO> rows = new java.util.ArrayList<>();
                 for (int r = firstDataRow; r <= lastRow; r++) {
                     Row row = sheet.getRow(r);
                     if (row == null) continue;
 
-                    String sku = normalize(formatter.formatCellValue(row.getCell(skuIdx)));
-                    String categoria = normalize(formatter.formatCellValue(row.getCell(catIdx)));
+                    String sku = readCellAsString(row, skuIdx, formatter);
+                    String categoria = readCellAsString(row, catIdx, formatter);
 
                     // saltiamo righe vuote
                     if (sku == null && categoria == null) continue;
 
-                    String nome = nomeIdx != null ? normalize(formatter.formatCellValue(row.getCell(nomeIdx))) : null;
+                    String nome = readCellAsString(row, nomeIdx, formatter);
                     Double prezzo = null;
                     if (prezzoIdx != null) {
                         prezzo = readNumericCellAsDouble(row.getCell(prezzoIdx), formatter);
                     }
+                    String disponibilita = readCellAsString(row, disponibilitaIdx, formatter);
+                    String ean = eanIdx != null ? readCellAsString(row, eanIdx, formatter) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
+                    dto.setEan(ean);
                     dto.setNome(nome);
                     dto.setNomeCategoria(categoria);
                     dto.setPrezzoBase(prezzo);
+                    dto.setDisponibilita(disponibilita);
                     rows.add(dto);
                 }
                 return rows;
@@ -650,11 +914,26 @@ public class ImportService {
                                 "Header XML non valido. Colonne viste = [" + String.join(", ", headerToIndex.keySet()) + "]. " + hint
                         );
                     }
+                    if (!headerToIndex.containsKey("disponibilita")) {
+                        for (int c = 0; c < cellValues.size(); c++) {
+                            String col = normalizeExcelHeaderCell(cellValues.get(c));
+                            if (col != null && col.equals("disponibilita")) {
+                                headerToIndex.put("disponibilita", c);
+                                break;
+                            }
+                        }
+                        // Fallback: colonna CS (indice 96) per disponibilità
+                        if (!headerToIndex.containsKey("disponibilita") && cellValues.size() > COLONNA_CS_INDEX) {
+                            headerToIndex.put("disponibilita", COLONNA_CS_INDEX);
+                        }
+                    }
                 } else {
                     Integer skuIdx = headerToIndex.get("sku");
                     Integer nomeIdx = headerToIndex.get("nome_prodotto");
                     Integer catIdx = headerToIndex.get("categoria");
                     Integer prezzoIdx = headerToIndex.get("prezzo");
+                    Integer disponibilitaIdx = headerToIndex.get("disponibilita");
+                    Integer eanIdx = headerToIndex.get("ean");
 
                     String sku = cellValues.size() > skuIdx ? normalize(cellValues.get(skuIdx)) : null;
                     String categoria = cellValues.size() > catIdx ? normalize(cellValues.get(catIdx)) : null;
@@ -663,19 +942,18 @@ public class ImportService {
                     String nome = nomeIdx != null && cellValues.size() > nomeIdx ? normalize(cellValues.get(nomeIdx)) : null;
                     Double prezzo = null;
                     if (prezzoIdx != null && cellValues.size() > prezzoIdx) {
-                        String pStr = normalize(cellValues.get(prezzoIdx));
-                        if (pStr != null) {
-                            try {
-                                prezzo = Double.parseDouble(pStr.replace(",", "."));
-                            } catch (NumberFormatException ignored) {}
-                        }
+                        prezzo = parsePriceFromString(normalize(cellValues.get(prezzoIdx)));
                     }
+                    String disponibilita = disponibilitaIdx != null && cellValues.size() > disponibilitaIdx ? normalize(cellValues.get(disponibilitaIdx)) : null;
+                    String ean = eanIdx != null && cellValues.size() > eanIdx ? normalize(cellValues.get(eanIdx)) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
+                    dto.setEan(ean);
                     dto.setNome(nome);
                     dto.setNomeCategoria(categoria);
                     dto.setPrezzoBase(prezzo);
+                    dto.setDisponibilita(disponibilita);
                     result.add(dto);
                 }
                 rowIdx++;
@@ -746,8 +1024,28 @@ public class ImportService {
             col = col.substring(1, col.length() - 1);
         }
         col = col.trim();
-        col = col.replace(' ', '_');
+        col = col.replaceAll("\\s+", "_");
+        col = col.replaceAll("[\\u200B-\\u200D\\uFEFF]", "");
+        // Rimuove caratteri di combinazione (es. U+0332 underline) che possono impedire il match con "CS"
+        col = col.replaceAll("\\p{M}", "");
         return aliasHeader(col);
+    }
+
+    /** Legge una cella come stringa, gestendo celle null o sparse. Per .xls gestisce anche celle numeriche. */
+    private String readCellAsString(Row row, Integer colIndex, DataFormatter formatter) {
+        if (row == null || colIndex == null || colIndex < 0) return null;
+        Cell cell = row.getCell(colIndex);
+        if (cell == null) return null;
+        try {
+            if (cell.getCellType() == CellType.NUMERIC) {
+                double n = cell.getNumericCellValue();
+                if (n == (long) n) return normalize(String.valueOf((long) n));
+                return normalize(String.valueOf(n));
+            }
+            return normalize(formatter.formatCellValue(cell));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private Double readNumericCellAsDouble(Cell cell, DataFormatter formatter) {
@@ -758,15 +1056,29 @@ public class ImportService {
             }
             if (cell.getCellType() == CellType.STRING) {
                 String s = normalize(cell.getStringCellValue());
-                if (s == null) return null;
-                s = s.replace(",", "."); // supporto decimali IT
-                return Double.parseDouble(s);
+                return parsePriceFromString(s);
             }
             String formatted = normalize(formatter.formatCellValue(cell));
-            if (formatted == null) return null;
-            formatted = formatted.replace(",", ".");
-            return Double.parseDouble(formatted);
+            return parsePriceFromString(formatted);
         } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /** Estrae un numero da stringhe come "10,50", "10.50", "10,50 €", "€ 10,50", "10,50 EUR". */
+    private Double parsePriceFromString(String s) {
+        if (s == null || s.isBlank()) return null;
+        s = s.trim()
+                .replace("€", "")
+                .replace("EUR", "")
+                .replace("euro", "")
+                .replaceAll("[^0-9,.-]", "")
+                .trim();
+        if (s.isEmpty()) return null;
+        s = s.replace(",", ".");
+        try {
+            return Double.parseDouble(s);
+        } catch (NumberFormatException ignored) {
             return null;
         }
     }
@@ -827,8 +1139,13 @@ public class ImportService {
             return "Ufficio";
         }
 
-        // Accessori
-        if (containsAny(text, "accessorio", "accessori", "custodia", "zaino", "borsa", "supporto", "stand", "adattatore", "adapter", "hub", "dock", "docking")) {
+        // Elettronica (prima di Accessori per match più specifici)
+        if (containsAny(text, "elettronica", "hardware", "storage", "ssd", "hdd", "disco", "memoria", "ram", "box estern", "enclosure", "usb3", "usb 3")) {
+            return "Elettronica";
+        }
+
+        // Accessori (catch-all per box, custodie, adattatori, ecc.)
+        if (containsAny(text, "accessorio", "accessori", "custodia", "zaino", "borsa", "supporto", "stand", "adattatore", "adapter", "hub", "dock", "docking", "box", "estern")) {
             return "Accessori";
         }
 
@@ -837,8 +1154,8 @@ public class ImportService {
             return "Scuola e Laboratori";
         }
 
-        // Nessuna regola ha fatto match: lascio null per permettere un fallback.
-        return null;
+        // Nessuna regola ha fatto match: Accessori come categoria generica
+        return "Accessori";
     }
 
     private boolean containsAny(String text, String... keywords) {

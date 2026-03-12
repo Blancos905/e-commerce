@@ -8,10 +8,13 @@ import com.e_commerce.model.Document;
 import com.e_commerce.model.Product;
 import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.ImportLogRepository;
+import com.e_commerce.service.IcecatService;
+import com.e_commerce.service.ImportService;
 import com.e_commerce.service.ProductService;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.nio.charset.StandardCharsets;
@@ -27,13 +30,19 @@ public class ProductController {
     private final ProductService productService;
     private final CategoryRepository categoryRepository;
     private final ImportLogRepository importLogRepository;
+    private final ImportService importService;
+    private final IcecatService icecatService;
 
     public ProductController(ProductService productService,
                              CategoryRepository categoryRepository,
-                             ImportLogRepository importLogRepository) {
+                             ImportLogRepository importLogRepository,
+                             ImportService importService,
+                             IcecatService icecatService) {
         this.productService = productService;
         this.categoryRepository = categoryRepository;
         this.importLogRepository = importLogRepository;
+        this.importService = importService;
+        this.icecatService = icecatService;
     }
 
     @GetMapping
@@ -75,11 +84,51 @@ public class ProductController {
         return ResponseEntity.noContent().build();
     }
 
+    @PostMapping("/{id}/sync-icecat-images")
+    public ResponseEntity<?> syncIcecatImages(@PathVariable Long id) {
+        if (productService.findById(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        int count = icecatService.syncImagesForProduct(id);
+        return ResponseEntity.ok(java.util.Map.of("imagesAdded", count));
+    }
+
+    @PostMapping("/sync-all-icecat-images")
+    public ResponseEntity<?> syncAllIcecatImages() {
+        int total = icecatService.syncImagesForAllProducts();
+        return ResponseEntity.ok(java.util.Map.of("imagesAdded", total));
+    }
+
+    @GetMapping("/can-rollback-last-import")
+    @Transactional(readOnly = true)
+    public ResponseEntity<Boolean> canRollbackLastImport() {
+        boolean canRollback = importLogRepository.existsAppliedImportWithSnapshot();
+        return ResponseEntity.ok(canRollback);
+    }
+
+    @PostMapping("/rollback-last-import")
+    @Transactional
+    public ResponseEntity<?> rollbackLastImport() {
+        return importLogRepository.findFirstByAppliedAtNotNullOrderByAppliedAtDesc()
+                .filter(log -> log.getPreviousStateJson() != null && !log.getPreviousStateJson().isBlank())
+                .map(log -> {
+                    try {
+                        importService.rollbackImport(log);
+                        return ResponseEntity.ok().build();
+                    } catch (Exception e) {
+                        return ResponseEntity.<Object>internalServerError()
+                                .body("Errore durante il rollback: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                    }
+                })
+                .orElseGet(() -> ResponseEntity.badRequest()
+                        .body("Nessun import applicato di recente su cui fare rollback."));
+    }
+
     @GetMapping(value = "/export/csv", produces = "text/csv")
     public ResponseEntity<byte[]> exportCsv() {
         List<Product> products = productService.findAll();
 
-        String header = "sku,nome_prodotto,categoria,prezzo_finale,documenti\n";
+        String header = "sku,nome_prodotto,categoria,prezzo_finale,disponibilita,documenti\n";
         String body = products.stream()
                 .map(p -> {
                     String categoria = p.getCategoria() != null ? p.getCategoria().getNome() : "";
@@ -93,6 +142,7 @@ public class ProductController {
                             safe(p.getNome()),
                             safe(categoria),
                             p.getPrezzoFinale() != null ? p.getPrezzoFinale().toString() : "",
+                            safe(p.getDisponibilita()),
                             safe(docs)
                     );
                 })
@@ -117,7 +167,7 @@ public class ProductController {
             return ResponseEntity.notFound().build();
         }
 
-        String header = "sku,nome_prodotto,categoria,prezzo_finale,documenti\n";
+        String header = "sku,nome_prodotto,categoria,prezzo_finale,disponibilita,documenti\n";
         String body = products.stream()
                 .map(p -> {
                     String categoria = p.getCategoria() != null ? p.getCategoria().getNome() : "";
@@ -131,6 +181,7 @@ public class ProductController {
                             safe(p.getNome()),
                             safe(categoria),
                             p.getPrezzoFinale() != null ? p.getPrezzoFinale().toString() : "",
+                            safe(p.getDisponibilita()),
                             safe(docs)
                     );
                 })

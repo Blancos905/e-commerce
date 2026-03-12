@@ -7,6 +7,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
 
@@ -16,7 +17,8 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
                 l.fileName,
                 l.tipo,
                 l.fileContentType,
-                l.importedAt
+                l.importedAt,
+                l.appliedAt
             )
             from ImportLog l
             where l.supplier.id = :supplierId
@@ -25,5 +27,11 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
     List<ImportLogSummaryDTO> findSummariesBySupplierIdOrderByImportedAtDesc(@Param("supplierId") Long supplierId);
 
     boolean existsByIdAndSupplierId(Long id, Long supplierId);
+
+    Optional<ImportLog> findFirstByAppliedAtNotNullOrderByAppliedAtDesc();
+
+    @Query("SELECT CASE WHEN COUNT(l.id) > 0 THEN true ELSE false END FROM ImportLog l " +
+            "WHERE l.appliedAt IS NOT NULL AND l.previousStateJson IS NOT NULL")
+    boolean existsAppliedImportWithSnapshot();
 }
 

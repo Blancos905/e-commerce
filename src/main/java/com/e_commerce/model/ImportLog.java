@@ -43,5 +43,20 @@ public class ImportLog {
      */
     @Column(nullable = false)
     private LocalDateTime importedAt;
+
+    /**
+     * Data e ora in cui l'import è stato applicato al catalogo (null = non ancora applicato).
+     */
+    @Column
+    private LocalDateTime appliedAt;
+
+    /**
+     * Snapshot JSON dello stato dei prodotti prima dell'import.
+     * Mappa SKU -> ProductSnapshotDTO. Permette il rollback senza resettare tutto il catalogo.
+     */
+    @Lob
+    @Column(name = "previous_state_json")
+    @JsonIgnore
+    private String previousStateJson;
 }
 

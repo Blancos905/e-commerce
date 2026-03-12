@@ -123,6 +123,8 @@ public class ProductService {
                 .map(existing -> {
                     existing.setNome(req.getNome());
                     existing.setDescrizione(req.getDescrizione());
+                    existing.setDisponibilita(req.getDisponibilita() != null && !req.getDisponibilita().trim().isEmpty()
+                            ? req.getDisponibilita().trim() : null);
                     existing.setPrezzoBase(req.getPrezzoBase());
                     existing.setAumentoPercentuale(req.getAumentoPercentuale());
                     if (req.getCategoriaId() != null) {

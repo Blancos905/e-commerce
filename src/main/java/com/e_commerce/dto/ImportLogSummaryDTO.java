@@ -7,7 +7,8 @@ public record ImportLogSummaryDTO(
         String fileName,
         String tipo,
         String fileContentType,
-        LocalDateTime importedAt
+        LocalDateTime importedAt,
+        LocalDateTime appliedAt
 ) {
 }
 

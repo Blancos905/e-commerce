@@ -15,8 +15,12 @@ import lombok.AllArgsConstructor;
 @AllArgsConstructor
 public class ProductImportDTO {
 
-    @CsvBindByName(column = "sku", required = true)
+    /** SKU o codice articolo; se assente si usa ean (per file con solo EAN) */
+    @CsvBindByName(column = "sku")
     private String sku;
+
+    @CsvBindByName(column = "ean")
+    private String ean;
 
     @CsvBindByName(column = "nome_prodotto")
     private String nome;
@@ -24,6 +28,10 @@ public class ProductImportDTO {
     @CsvBindByName(column = "prezzo")
     private Double prezzoBase;
 
-    @CsvBindByName(column = "categoria", required = true)
+    @CsvBindByName(column = "categoria")
     private String nomeCategoria;
+
+    /** CS = disponibilità (quella che ci interessa) */
+    @CsvBindByName(column = "disponibilita")
+    private String disponibilita;
 }

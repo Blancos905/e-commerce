@@ -5,8 +5,6 @@ import com.e_commerce.model.ImportLog;
 import com.e_commerce.model.Supplier;
 import com.e_commerce.service.ImportService;
 import com.e_commerce.service.SupplierService;
-import com.e_commerce.repository.ProductRepository;
-import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.ImportLogRepository;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -24,19 +22,13 @@ public class SupplierController {
 
     private final SupplierService supplierService;
     private final ImportLogRepository importLogRepository;
-    private final ProductRepository productRepository;
-    private final CategoryRepository categoryRepository;
     private final ImportService importService;
 
     public SupplierController(SupplierService supplierService,
                               ImportLogRepository importLogRepository,
-                              ProductRepository productRepository,
-                              CategoryRepository categoryRepository,
                               ImportService importService) {
         this.supplierService = supplierService;
         this.importLogRepository = importLogRepository;
-        this.productRepository = productRepository;
-        this.categoryRepository = categoryRepository;
         this.importService = importService;
     }
 
@@ -76,18 +68,28 @@ public class SupplierController {
             }
             ImportLog log = new ImportLog();
             log.setSupplier(supplier);
-            log.setTipo(tipo != null && !tipo.isBlank() ? tipo.trim().toUpperCase() : "PRODOTTI");
+            String tipoValue = tipo != null && !tipo.isBlank() ? tipo.trim().toUpperCase() : "PRODOTTI";
+            log.setTipo(tipoValue);
             log.setFileName(file.getOriginalFilename() != null ? file.getOriginalFilename() : "import.csv");
             log.setFileContent(file.getBytes());
             log.setFileContentType(file.getContentType());
             log.setImportedAt(LocalDateTime.now());
             ImportLog saved = importLogRepository.save(log);
+            if ("PRODOTTI".equalsIgnoreCase(tipoValue)) {
+                try {
+                    importService.applyImportWithSnapshot(saved);
+                } catch (Exception e) {
+                    throw new RuntimeException("Errore durante l'applicazione al catalogo: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+                }
+            }
+            saved = importLogRepository.findById(saved.getId()).orElse(saved);
             return ResponseEntity.ok(new ImportLogSummaryDTO(
                     saved.getId(),
                     saved.getFileName(),
                     saved.getTipo(),
                     saved.getFileContentType(),
-                    saved.getImportedAt()
+                    saved.getImportedAt(),
+                    saved.getAppliedAt()
             ));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
@@ -111,7 +113,7 @@ public class SupplierController {
             return ResponseEntity.badRequest().body("Questo CSV non è di tipo PRODOTTI.");
         }
         try {
-            importService.importProductsFromImportLog(log);
+            importService.applyImportWithSnapshot(log);
             return ResponseEntity.ok().build();
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
@@ -121,9 +123,33 @@ public class SupplierController {
         }
     }
 
+    @PostMapping("/{id}/imports/{importId}/rollback")
+    @Transactional
+    public ResponseEntity<?> rollbackImport(@PathVariable Long id, @PathVariable Long importId) {
+        if (supplierService.findById(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        ImportLog log = importLogRepository.findById(importId).orElse(null);
+        if (log == null || log.getSupplier() == null || !log.getSupplier().getId().equals(id)) {
+            return ResponseEntity.notFound().build();
+        }
+        if (log.getTipo() == null || !"PRODOTTI".equalsIgnoreCase(log.getTipo())) {
+            return ResponseEntity.badRequest().body("Rollback supportato solo per import di tipo PRODOTTI.");
+        }
+        try {
+            importService.rollbackImport(log);
+            return ResponseEntity.ok().build();
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body("Errore durante il rollback: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
     @DeleteMapping("/{id}/imports/{importId}")
     @Transactional
-    public ResponseEntity<Void> deleteImport(@PathVariable Long id, @PathVariable Long importId) {
+    public ResponseEntity<?> deleteImport(@PathVariable Long id, @PathVariable Long importId) {
         if (supplierService.findById(id).isEmpty()) {
             return ResponseEntity.notFound().build();
         }
@@ -132,15 +158,15 @@ public class SupplierController {
         }
 
         ImportLog log = importLogRepository.findById(importId).orElse(null);
-        if (log != null && "PRODOTTI".equalsIgnoreCase(log.getTipo())) {
-            // 1) cancello tutti i prodotti del fornitore
-            productRepository.deleteByFornitoreId(id);
-            // 2) pulizia categorie non più utilizzate da alcun prodotto
-            categoryRepository.findAll().forEach(category -> {
-                if (!productRepository.existsByCategoriaId(category.getId())) {
-                    categoryRepository.delete(category);
-                }
-            });
+        if (log != null && "PRODOTTI".equalsIgnoreCase(log.getTipo())
+                && log.getPreviousStateJson() != null && !log.getPreviousStateJson().isBlank()) {
+            try {
+                importService.rollbackImport(log);
+                return ResponseEntity.noContent().build();
+            } catch (Exception e) {
+                return ResponseEntity.internalServerError()
+                        .body("Errore durante il rollback prima dell'eliminazione: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+            }
         }
 
         importLogRepository.deleteById(importId);

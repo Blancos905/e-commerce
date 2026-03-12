@@ -18,6 +18,10 @@ public class Product {
     @Column(unique = true, nullable = false)
     private String sku;
 
+    /** EAN/GTIN per lookup Icecat (opzionale; se assente si usa sku) */
+    @Column(length = 32)
+    private String ean;
+
     @Column(nullable = false)
     private String nome;
 
@@ -42,6 +46,14 @@ public class Product {
     @ManyToOne
     @JoinColumn(name = "supplier_id")
     private Supplier fornitore;
+
+    /** CON = contati (stock contato dal fornitore) */
+    @Column(length = 64)
+    private String contati;
+
+    /** CS = disponibilità (quella che ci interessa) */
+    @Column(length = 64)
+    private String disponibilita;
 
     @BatchSize(size = 50)
     @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true)

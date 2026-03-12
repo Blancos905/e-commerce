@@ -70,6 +70,17 @@ public class CategoryController {
             result.add(category);
         }
 
+        // Migra prodotti da "Senza categoria" a "Accessori" (ogni prodotto deve avere una categoria)
+        Category accessori = categoryService.findByNome("Accessori").orElse(null);
+        if (accessori != null) {
+            categoryService.findByNome("Senza categoria").ifPresent(senzaCat -> {
+                productRepository.findByCategoriaId(senzaCat.getId()).forEach(p -> {
+                    p.setCategoria(accessori);
+                    productRepository.save(p);
+                });
+            });
+        }
+
         return ResponseEntity.ok(result);
     }
 
