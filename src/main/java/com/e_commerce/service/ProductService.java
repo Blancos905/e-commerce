@@ -50,15 +50,20 @@ public class ProductService {
         return productRepository.findByFornitoreId(fornitoreId);
     }
 
-    public List<Product> search(String nome, String sku, String categoria) {
+    public List<Product> search(String nome, String sku, String ean, String categoria, String fornitore) {
         List<Product> all = productRepository.findAllWithAssociations();
-        String nomeFilter = nome != null ? nome.trim() : null;
-        String skuFilter = sku != null ? sku.trim() : null;
+        String nomeFilter = (nome != null && !nome.isBlank()) ? nome.trim() : null;
+        String skuFilter = (sku != null && !sku.isBlank()) ? sku.trim() : null;
+        String eanFilter = (ean != null && !ean.isBlank()) ? ean.trim() : null;
+        String fornitoreFilter = (fornitore != null && !fornitore.isBlank()) ? fornitore.trim() : null;
         return all.stream()
                 .filter(p -> nomeFilter == null || matchesSearchText(p.getNome(), nomeFilter))
                 .filter(p -> skuFilter == null || matchesSearchText(p.getSku(), skuFilter))
+                .filter(p -> eanFilter == null || matchesSearchText(p.getEan(), eanFilter))
                 .filter(p -> categoria == null || (p.getCategoria() != null &&
                         categoria.equalsIgnoreCase(p.getCategoria().getNome())))
+                .filter(p -> fornitoreFilter == null || (p.getFornitore() != null &&
+                        matchesSearchText(p.getFornitore().getNome(), fornitoreFilter)))
                 .collect(Collectors.toList());
     }
 
@@ -125,6 +130,8 @@ public class ProductService {
                     existing.setDescrizione(req.getDescrizione());
                     existing.setDisponibilita(req.getDisponibilita() != null && !req.getDisponibilita().trim().isEmpty()
                             ? req.getDisponibilita().trim() : null);
+                    existing.setEan(req.getEan() != null && !req.getEan().trim().isEmpty()
+                            ? req.getEan().trim() : null);
                     existing.setPrezzoBase(req.getPrezzoBase());
                     existing.setAumentoPercentuale(req.getAumentoPercentuale());
                     if (req.getCategoriaId() != null) {

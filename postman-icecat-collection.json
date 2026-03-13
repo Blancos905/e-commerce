@@ -1,0 +1,207 @@
+{
+  "info": {
+    "name": "E-Commerce - Icecat API",
+    "description": "Test Icecat per ottenere informazioni prodotto e immagini",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8083"
+    },
+    {
+      "key": "ean",
+      "value": "5702016371116",
+      "description": "EAN di test Open Icecat (LEGO). Usa solo EAN da brand partner: https://icecat.biz/ssr/menu/partners"
+    },
+    {
+      "key": "productId",
+      "value": "1"
+    },
+    {
+      "key": "icecatUsername",
+      "value": "admin"
+    },
+    {
+      "key": "icecatPassword",
+      "value": "admin"
+    }
+  ],
+  "item": [
+    {
+      "name": "Backend API - Icecat",
+      "item": [
+        {
+          "name": "Icecat Test - URL immagini (per EAN)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/icecat-test?ean={{ean}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "icecat-test"],
+              "query": [
+                {
+                  "key": "ean",
+                  "value": "{{ean}}",
+                  "description": "EAN/GTIN 8-14 cifre (es. 8057284620150)"
+                }
+              ]
+            },
+            "description": "Testa Icecat per un EAN e restituisce le URL delle immagini trovate (senza salvare)."
+          }
+        },
+        {
+          "name": "Icecat Diagnose - Diagnostica",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/icecat-diagnose?ean={{ean}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "icecat-diagnose"],
+              "query": [
+                {
+                  "key": "ean",
+                  "value": "{{ean}}",
+                  "description": "EAN/GTIN 8-14 cifre"
+                }
+              ]
+            },
+            "description": "Diagnostica: verifica credenziali, prodotto trovato/non trovato, numero immagini."
+          }
+        },
+        {
+          "name": "Sync Icecat - Singolo prodotto",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/{{productId}}/sync-icecat-images",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "{{productId}}", "sync-icecat-images"]
+            },
+            "description": "Sincronizza immagini e descrizione Icecat per un prodotto (ID). Scarica in storage e aggiorna DB."
+          }
+        },
+        {
+          "name": "Sync Icecat - Tutti i prodotti",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/sync-all-icecat-images",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "sync-all-icecat-images"]
+            },
+            "description": "Sincronizza immagini Icecat per tutti i prodotti con EAN valido."
+          }
+        },
+        {
+          "name": "Icecat Test Connection (confronta con Postman)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/icecat-test-connection?ean={{ean}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "icecat-test-connection"],
+              "query": [
+                {
+                  "key": "ean",
+                  "value": "{{ean}}",
+                  "description": "Stesso EAN usato in Postman. Se Postman funziona ma questo no, copia icecat.username e icecat.password da Postman in application.properties"
+                }
+              ]
+            },
+            "description": "Esegue la STESSA chiamata Icecat che fai in Postman. Confronta authSent, authUser, hasProduct. Se hasProduct=false ma Postman funziona, le credenziali in application.properties sono diverse."
+          }
+        },
+        {
+          "name": "Icecat Raw XML (debug)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/icecat-raw?ean={{ean}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "icecat-raw"],
+              "query": [
+                {
+                  "key": "ean",
+                  "value": "{{ean}}",
+                  "description": "EAN per vedere la risposta XML grezza da Icecat"
+                }
+              ]
+            },
+            "description": "Restituisce l'XML grezzo da Icecat (primi 5000 caratteri) per capire perché non vengono trovate immagini."
+          }
+        },
+        {
+          "name": "Icecat Storage Path",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/products/icecat-storage-path",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "products", "icecat-storage-path"]
+            },
+            "description": "Restituisce il path assoluto della cartella storage Icecat."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Icecat API Diretta",
+      "item": [
+        {
+          "name": "Icecat - XML Prodotto (info + immagini)",
+          "request": {
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{icecatUsername}}",
+                  "type": "string"
+                },
+                {
+                  "key": "password",
+                  "value": "{{icecatPassword}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "https://data.icecat.biz/xml_s3/xml_server3.cgi?lang=IT&ean_upc={{ean}}&output=productxml",
+              "protocol": "https",
+              "host": ["data", "icecat", "biz"],
+              "path": ["xml_s3", "xml_server3.cgi"],
+              "query": [
+                {
+                  "key": "lang",
+                  "value": "IT",
+                  "description": "Lingua (IT, EN, DE, ...)"
+                },
+                {
+                  "key": "ean_upc",
+                  "value": "{{ean}}",
+                  "description": "EAN/GTIN 8-14 cifre"
+                },
+                {
+                  "key": "output",
+                  "value": "productxml",
+                  "description": "Formato risposta"
+                }
+              ]
+            },
+            "description": "Chiamata diretta all'API Icecat. Restituisce XML con Product, ProductGallery (immagini), descrizioni. Richiede credenziali Open Icecat (registrazione gratuita su https://icecat.biz)."
+          }
+        }
+      ]
+    }
+  ]
+}

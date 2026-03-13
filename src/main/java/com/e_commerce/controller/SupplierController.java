@@ -75,13 +75,7 @@ public class SupplierController {
             log.setFileContentType(file.getContentType());
             log.setImportedAt(LocalDateTime.now());
             ImportLog saved = importLogRepository.save(log);
-            if ("PRODOTTI".equalsIgnoreCase(tipoValue)) {
-                try {
-                    importService.applyImportWithSnapshot(saved);
-                } catch (Exception e) {
-                    throw new RuntimeException("Errore durante l'applicazione al catalogo: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
-                }
-            }
+            // Salva solo in cartella: l'import nel catalogo avviene separatamente quando l'utente clicca "Importa nel catalogo" (⇢)
             saved = importLogRepository.findById(saved.getId()).orElse(saved);
             return ResponseEntity.ok(new ImportLogSummaryDTO(
                     saved.getId(),
@@ -162,7 +156,6 @@ public class SupplierController {
                 && log.getPreviousStateJson() != null && !log.getPreviousStateJson().isBlank()) {
             try {
                 importService.rollbackImport(log);
-                return ResponseEntity.noContent().build();
             } catch (Exception e) {
                 return ResponseEntity.internalServerError()
                         .body("Errore durante il rollback prima dell'eliminazione: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));

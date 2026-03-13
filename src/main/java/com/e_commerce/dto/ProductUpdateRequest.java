@@ -14,6 +14,8 @@ public class ProductUpdateRequest {
 
     private String disponibilita;
 
+    private String ean;
+
     private BigDecimal prezzoBase;
 
     private Double aumentoPercentuale;

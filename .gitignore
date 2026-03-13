@@ -24,3 +24,6 @@ bin/
 # OS
 .DS_Store
 Thumbs.db
+
+# Icecat: immagini e descrizioni scaricate
+storage/

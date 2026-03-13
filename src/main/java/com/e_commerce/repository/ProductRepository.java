@@ -28,6 +28,8 @@ public interface ProductRepository extends JpaRepository<Product, Long> {
 
     Optional<Product> findBySku(String sku);
 
+    Optional<Product> findByEan(String ean);
+
     List<Product> findByCategoriaNome(String nomeCategoria);
 
     List<Product> findByNomeContainingIgnoreCase(String nome);

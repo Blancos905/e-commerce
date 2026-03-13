@@ -43,7 +43,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
-import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
@@ -53,6 +52,10 @@ public class ImportService {
 
     /** Indice colonna Excel CS (97ª colonna, 0-based=96), usata spesso per disponibilità. */
     private static final int COLONNA_CS_INDEX = 96;
+    /** Indice colonna CS in file con molte colonne – colonna AG (33ª colonna Excel, 0-based=32). */
+    private static final int COLONNA_CS_ALTERNATIVA = 32;
+    /** Prima riga dati in questo formato – riga 15 Excel (0-based=14). */
+    private static final int FIRST_DATA_ROW_ALTERNATIVA = 14;
 
     private final ProductRepository productRepository;
     private final CategoryRepository categoryRepository;
@@ -60,19 +63,22 @@ public class ImportService {
     private final SupplierRepository supplierRepository;
     private final ImportLogRepository importLogRepository;
     private final ProductService productService;
+    private final ProductMatchingService productMatchingService;
 
     public ImportService(ProductRepository productRepository,
                          CategoryRepository categoryRepository,
                          DocumentRepository documentRepository,
                          SupplierRepository supplierRepository,
                          ImportLogRepository importLogRepository,
-                         ProductService productService) {
+                         ProductService productService,
+                         ProductMatchingService productMatchingService) {
         this.productRepository = productRepository;
         this.categoryRepository = categoryRepository;
         this.documentRepository = documentRepository;
         this.supplierRepository = supplierRepository;
         this.importLogRepository = importLogRepository;
         this.productService = productService;
+        this.productMatchingService = productMatchingService;
     }
 
     public void importProducts(MultipartFile file, Long supplierId) throws Exception {
@@ -120,7 +126,7 @@ public class ImportService {
             String sku = normalize(dto.getSku());
             if (sku == null) continue;
             String skuTruncated = truncate(sku, 255);
-            productRepository.findBySku(skuTruncated).ifPresent(p -> snapshot.put(skuTruncated, toSnapshot(p)));
+            productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> snapshot.put(skuTruncated, toSnapshot(p)));
         }
         processProductRows(rows, log.getSupplier());
         ObjectMapper mapper = new ObjectMapper();
@@ -130,7 +136,8 @@ public class ImportService {
     }
 
     /**
-     * Annulla l'ultimo import: ripristina i prodotti modificati ed elimina quelli creati.
+     * Annulla l'ultimo import: ripristina i prodotti modificati ed elimina quelli creati nel catalogo virtuale.
+     * Il file nella cartella fornitori (ImportLog) non viene eliminato: resta disponibile per eventuale ri-import.
      */
     public void rollbackImport(ImportLog log) throws Exception {
         if (log == null || log.getPreviousStateJson() == null || log.getPreviousStateJson().isBlank()) {
@@ -154,10 +161,13 @@ public class ImportService {
             if (snap != null) {
                 restoreFromSnapshot(snap);
             } else {
-                productRepository.findBySku(skuTruncated).ifPresent(p -> productService.deleteById(p.getId()));
+                productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> productService.deleteById(p.getId()));
             }
         }
-        importLogRepository.delete(log);
+        // Non eliminare l'ImportLog: il file resta nella cartella fornitori. Solo annulliamo lo stato "applicato".
+        log.setAppliedAt(null);
+        log.setPreviousStateJson(null);
+        importLogRepository.save(log);
     }
 
     private ProductSnapshotDTO toSnapshot(Product p) {
@@ -234,13 +244,15 @@ public class ImportService {
                         c.setNome(nomeCategoria);
                         return categoryRepository.save(c);
                     });
-            Product product = productRepository.findBySku(sku).orElseGet(Product::new);
+            Product product = productMatchingService.findProductBySkuOnly(sku).getProduct().orElseGet(Product::new);
             product.setSku(sku);
             product.setNome(nomeProdotto);
             product.setPrezzoBase(dto.getPrezzoBase() != null ? BigDecimal.valueOf(dto.getPrezzoBase()) : BigDecimal.ZERO);
             product.setCategoria(category);
             product.setFornitore(supplier);
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
+            String eanVal = normalize(dto.getEan());
+            product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
             productService.save(product);
         }
     }
@@ -267,28 +279,40 @@ public class ImportService {
 
         int rowNumber = 1; // 1-based rispetto alle righe dati (escluso header)
         for (ProductImportDTO dto : rows) {
-            String sku = normalize(dto.getSku());
-            if (sku == null) {
-                sku = normalize(dto.getEan()); // fallback: EAN come SKU (molti fornitori usano EAN come codice)
+            String codiceRaw = normalize(dto.getSku());
+            if (codiceRaw == null) {
+                codiceRaw = normalize(dto.getEan());
             }
-            if (sku == null) {
+            if (codiceRaw == null) {
                 rowNumber++;
-                continue; // salta righe senza SKU (righe vuote o dati incompleti)
+                continue; // salta righe senza codice (righe vuote o dati incompleti)
             }
-            // Rispetta il limite DB VARCHAR(255)
-            sku = truncate(sku, 255);
 
-            // `Product.nome` è NOT NULL: se nel CSV manca/è vuoto, usiamo lo SKU come fallback
+            String eanFromCol = normalize(dto.getEan());
+            String digitsOnly = ProductMatchingService.normalizeEan(codiceRaw);
+            boolean isCodiceEan = digitsOnly != null && digitsOnly.length() >= 8 && digitsOnly.length() <= 14;
+
+            String sku;
+            String ean;
+            if (isCodiceEan) {
+                // Codice è un EAN: usalo solo come EAN, SKU = "EAN-xxx" (mai uguali)
+                ean = eanFromCol != null ? truncate(eanFromCol, 32) : truncate(codiceRaw, 255);
+                sku = "EAN-" + ean;
+                sku = truncate(sku, 255);
+            } else {
+                // Codice è uno SKU (alfanumerico): usalo come SKU, EAN solo da colonna
+                sku = truncate(codiceRaw, 255);
+                ean = eanFromCol != null ? truncate(eanFromCol, 32) : null;
+            }
+
+            // `Product.nome` è NOT NULL: se manca, usiamo EAN o SKU come fallback
             String nomeProdotto = normalize(dto.getNome());
             if (nomeProdotto == null) {
-                nomeProdotto = sku;
+                nomeProdotto = (ean != null ? ean : sku);
             }
-            // Rispetta il limite DB VARCHAR(255)
             nomeProdotto = truncate(nomeProdotto, 255);
 
             String rawNomeCategoria = normalize(dto.getNomeCategoria());
-            // Se la categoria del CSV esiste già nel DB (anche creata dall'utente), usala direttamente.
-            // Altrimenti mappiamo tramite keyword su macro-categorie standard.
             String nomeCategoria;
             if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
                     && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
@@ -306,13 +330,16 @@ public class ImportService {
                         return categoryRepository.save(c);
                     });
 
-            Product product = productRepository.findBySku(sku)
+            // Match: se codice era EAN, cerca per EAN; altrimenti per SKU
+            Product product = (isCodiceEan
+                    ? productMatchingService.findProduct(null, ean)
+                    : productMatchingService.findProductBySku(sku))
+                    .getProduct()
                     .orElseGet(Product::new);
             product.setSku(sku);
+            product.setEan(ean);
             product.setNome(nomeProdotto);
 
-            // Gestione prezzo base: il DB ha un vincolo NOT NULL sulla colonna
-            // quindi se nel CSV il prezzo manca lo impostiamo a 0 per evitare l'errore.
             if (dto.getPrezzoBase() != null) {
                 product.setPrezzoBase(BigDecimal.valueOf(dto.getPrezzoBase()));
             } else {
@@ -326,10 +353,6 @@ public class ImportService {
             }
 
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
-
-            // EAN per Icecat: usa colonna ean se presente, altrimenti sku (molti fornitori usano EAN come codice)
-            String eanVal = normalize(dto.getEan());
-            product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
 
             productService.save(product);
             rowNumber++;
@@ -349,7 +372,7 @@ public class ImportService {
     }
 
     public void importDocuments(MultipartFile file, Long supplierId) throws Exception {
-        List<DocumentImportDTO> rows = parseCsv(file, DocumentImportDTO.class, "Documenti: header atteso: sku,tipo_documento,url_documento (delimitatore ',' o ';').");
+        List<DocumentImportDTO> rows = parseCsv(file, DocumentImportDTO.class, "Documenti: header atteso: sku (o ean),tipo_documento,url_documento (delimitatore ',' o ';').");
 
         Supplier supplier = null;
         if (supplierId != null) {
@@ -358,12 +381,16 @@ public class ImportService {
         }
 
         for (DocumentImportDTO dto : rows) {
-            String sku = normalize(dto.getSku());
-            if (sku == null) {
+            String sku = ProductMatchingService.normalizeIdentifier(dto.getSku());
+            String ean = ProductMatchingService.normalizeEan(dto.getEan());
+            if ((sku == null || sku.isBlank()) && (ean == null || ean.isBlank())) {
                 continue;
             }
-            Product product = productRepository.findBySku(sku)
-                    .orElseThrow(() -> new IllegalArgumentException("Prodotto non trovato per SKU: " + sku));
+            String identifier = sku != null ? sku : ean;
+            Product product = productMatchingService.findProductForDocument(sku, ean)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "Prodotto non trovato per SKU/EAN: \"" + identifier + "\". "
+                                    + "Verifica che il prodotto esista nel catalogo (match: SKU esatto, normalizzato, EAN)."));
 
             Document document = new Document();
             document.setTipo(normalize(dto.getTipoDocumento()));
@@ -590,20 +617,21 @@ public class ImportService {
 
     private String aliasHeader(String col) {
         if (col == null) return null;
+        col = col.replace("\u00A0", " ").replaceAll("\\s+", " ").trim();
         col = col.replaceAll("\\p{M}", "");
-        if (col.equals("cs") || col.matches("cs[_(\\(\\-].*")) {
+        if (col.equals("cs") || col.equals("c.s") || col.equals("c.s.") || col.matches("cs[_(\\(\\-].*")) {
             return "disponibilita";
         }
         if (col.contains("disponibil") || col.contains("stock") || col.contains("giacenza") || col.contains("availability")) {
             return "disponibilita";
         }
         return switch (col) {
-            // sku
+            // sku (codice interno; barcode va in ean quando c'è colonna sku separata)
             case "codice", "code", "product_code", "productcode", "sku_prodotto",
                     "codice_articolo", "codicearticolo", "art_code", "item_code",
-                    "barcode", "cod_articolo", "cod_art", "articolo_cod", "ref", "reference" -> "sku";
-            // ean (per Icecat)
-            case "ean", "gtin", "ean13", "ean_upc" -> "ean";
+                    "cod_articolo", "cod_art", "articolo_cod", "ref", "reference" -> "sku";
+            // ean / barcode (per Icecat; barcode = codice a barre = EAN)
+            case "ean", "gtin", "ean13", "ean_upc", "barcode" -> "ean";
 
             // prodotti - nome
             case "nome" -> "nome_prodotto";
@@ -722,13 +750,23 @@ public class ImportService {
                     Integer skuIdx = candidate.get("sku");
                     Integer catIdx = candidate.get("categoria");
                     if (skuIdx == null || catIdx == null) continue;
+                    // Salta righe che sembrano indirizzi (es. "Via N. Da Conti...")
+                    String firstCell = row.getCell(0) != null ? formatter.formatCellValue(row.getCell(0)).trim() : "";
+                    if (firstCell.length() > 60 && (firstCell.toLowerCase().contains("via ") || firstCell.contains("tel") || firstCell.contains("fax") || firstCell.contains("@") || firstCell.contains("c.da"))) {
+                        continue;
+                    }
                     int score = 1;
                     if (candidate.containsKey("nome_prodotto")) score++;
                     if (candidate.containsKey("prezzo")) score++;
                     if (candidate.containsKey("disponibilita")) score++;
                     if (score > bestScore) {
                         bestScore = score;
-                        headerRow = row;
+                        // Se la riga corrente è vuota/indirizzo e l'header viene dalla riga sotto (merge), usa la riga sotto
+                        boolean currentRowHasHeader = skuIdx != null && row.getCell(skuIdx) != null
+                                && "sku".equals(normalizeExcelHeaderCell(formatter.formatCellValue(row.getCell(skuIdx))));
+                        headerRow = (nextRow != null && !currentRowHasHeader && nextRow.getCell(skuIdx) != null
+                                && "sku".equals(normalizeExcelHeaderCell(formatter.formatCellValue(nextRow.getCell(skuIdx)))))
+                                ? nextRow : row;
                         headerToIndex.clear();
                         headerToIndex.putAll(candidate);
                         Integer dispIdx = candidate.get("disponibilita");
@@ -760,10 +798,23 @@ public class ImportService {
                 Integer disponibilitaIdx = headerToIndex.get("disponibilita");
                 Integer eanIdx = headerToIndex.get("ean");
                 int firstDataRow = headerRow.getRowNum() + (usedSubHeader ? 2 : 1);
+                // Controllo esplicito colonna 33 (formato con molte colonne: Category,Brand,Codice,...,CS,PZ)
+                if (headerRow.getLastCellNum() > COLONNA_CS_ALTERNATIVA) {
+                    Cell cell33 = headerRow.getCell(COLONNA_CS_ALTERNATIVA);
+                    if (cell33 != null) {
+                        String raw33 = formatter.formatCellValue(cell33);
+                        String norm33 = raw33 != null ? raw33.trim().replaceAll("[\\s\\u00A0._-]+", "").replaceAll("\\p{M}", "") : "";
+                        if (norm33.equalsIgnoreCase("cs") || "disponibilita".equals(normalizeExcelHeaderCell(raw33))) {
+                            disponibilitaIdx = COLONNA_CS_ALTERNATIVA;
+                            firstDataRow = FIRST_DATA_ROW_ALTERNATIVA; // dati da riga 15 Excel
+                        }
+                    }
+                }
                 if (disponibilitaIdx == null) {
-                    // Cerca nella riga header e nella riga successiva (header su 2 righe)
-                    Row subHeaderRow = sheet.getRow(headerRow.getRowNum() + 1);
-                    for (Row rowToScan : new Row[]{headerRow, subHeaderRow}) {
+                    // Cerca nella riga header e fino alla 35ª riga (0-based=34)
+                    int maxScanRow = 34;
+                    for (int scanR = headerRow.getRowNum(); scanR <= maxScanRow && disponibilitaIdx == null; scanR++) {
+                        Row rowToScan = sheet.getRow(scanR);
                         if (rowToScan == null) continue;
                         for (int c = 0; c < rowToScan.getLastCellNum(); c++) {
                             Cell cell = rowToScan.getCell(c);
@@ -774,37 +825,21 @@ public class ImportService {
                             String col = normalizeExcelHeaderCell(raw);
                             if ((col != null && col.equals("disponibilita")) || rawNorm.equalsIgnoreCase("cs")) {
                                 disponibilitaIdx = c;
-                                if (rowToScan == subHeaderRow) {
-                                    firstDataRow = headerRow.getRowNum() + 2;
+                                if (scanR > headerRow.getRowNum()) {
+                                    firstDataRow = Math.max(firstDataRow, scanR + 1);
                                 }
                                 break;
                             }
                         }
-                        if (disponibilitaIdx != null) break;
                     }
-                    // Fallback: scansiona le prime 25 righe per trovare una cella "CS" (o C.S., C S, ecc.)
-                    if (disponibilitaIdx == null) {
-                        for (int rr = firstRowNum; rr <= Math.min(firstRowNum + 24, sheet.getLastRowNum()); rr++) {
-                            Row r = sheet.getRow(rr);
-                            if (r == null) continue;
-                            for (int c = 0; c < r.getLastCellNum(); c++) {
-                                Cell cell = r.getCell(c);
-                                if (cell == null) continue;
-                                String raw = formatter.formatCellValue(cell);
-                                if (raw == null) continue;
-                                String norm = raw.trim().replaceAll("[\\s\\u00A0._-]+", "").replaceAll("\\p{M}", "");
-                                if (norm.equalsIgnoreCase("cs")) {
-                                    disponibilitaIdx = c;
-                                    if (rr > headerRow.getRowNum()) {
-                                        firstDataRow = rr + 1;
-                                    }
-                                    break;
-                                }
-                            }
-                            if (disponibilitaIdx != null) break;
-                        }
-                    }
-                    if (disponibilitaIdx == null) {
+                }
+                if (disponibilitaIdx == null) {
+                    // Fallback: usa colonna 33 (CS) se il file ha abbastanza colonne
+                    int maxCol = headerRow.getLastCellNum() - 1;
+                    if (maxCol >= COLONNA_CS_ALTERNATIVA) {
+                        disponibilitaIdx = COLONNA_CS_ALTERNATIVA;
+                        firstDataRow = Math.max(firstDataRow, FIRST_DATA_ROW_ALTERNATIVA);
+                    } else if (maxCol >= COLONNA_CS_INDEX) {
                         disponibilitaIdx = COLONNA_CS_INDEX;
                     }
                 }
@@ -814,6 +849,15 @@ public class ImportService {
                 for (int r = firstDataRow; r <= lastRow; r++) {
                     Row row = sheet.getRow(r);
                     if (row == null) continue;
+
+                    // Riga tipo "-EAN:8057284620150" sulla riga sotto al prodotto: assegna EAN al prodotto precedente
+                    String eanFromRow = extractEanFromRow(row, formatter);
+                    if (eanFromRow != null) {
+                        if (!rows.isEmpty()) {
+                            rows.get(rows.size() - 1).setEan(eanFromRow);
+                        }
+                        continue;
+                    }
 
                     String sku = readCellAsString(row, skuIdx, formatter);
                     String categoria = readCellAsString(row, catIdx, formatter);
@@ -860,7 +904,7 @@ public class ImportService {
             factory.setNamespaceAware(true);
             factory.setIgnoringElementContentWhitespace(true);
             DocumentBuilder builder = factory.newDocumentBuilder();
-            Document doc = builder.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+            org.w3c.dom.Document doc = builder.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
 
             Element workbook = doc.getDocumentElement();
             if (workbook == null || !"Workbook".equals(workbook.getLocalName())) {
@@ -895,39 +939,65 @@ public class ImportService {
 
             Map<String, Integer> headerToIndex = new HashMap<>();
             java.util.ArrayList<ProductImportDTO> result = new java.util.ArrayList<>();
-            int rowIdx = 0;
+            int headerRowIdx = -1;
 
             for (int i = 0; i < rows.getLength(); i++) {
                 Element rowEl = (Element) rows.item(i);
                 List<String> cellValues = extractRowCells(rowEl);
-                if (rowIdx == 0) {
+                if (headerRowIdx < 0) {
+                    Map<String, Integer> candidate = new HashMap<>();
                     for (int c = 0; c < cellValues.size(); c++) {
                         String col = normalizeExcelHeaderCell(cellValues.get(c));
-                        if (col != null && !col.isBlank()) {
-                            headerToIndex.put(col, c);
-                        }
+                        if (col != null && !col.isBlank()) candidate.put(col, c);
                     }
-                    Integer skuIdx = headerToIndex.get("sku");
-                    Integer catIdx = headerToIndex.get("categoria");
-                    if (skuIdx == null || catIdx == null) {
+                    if (candidate.get("sku") == null || candidate.get("categoria") == null) {
+                        String firstCell = cellValues.isEmpty() ? "" : (cellValues.get(0) != null ? cellValues.get(0).trim() : "");
+                        if (firstCell.length() > 60 && (firstCell.toLowerCase().contains("via ") || firstCell.contains("@") || firstCell.contains("c.da"))) {
+                            continue;
+                        }
                         throw new IllegalArgumentException(
-                                "Header XML non valido. Colonne viste = [" + String.join(", ", headerToIndex.keySet()) + "]. " + hint
+                                "Header XML non valido alla riga " + (i + 1) + ". Colonne viste = [" + String.join(", ", candidate.keySet()) + "]. " + hint
                         );
                     }
+                    headerToIndex.putAll(candidate);
                     if (!headerToIndex.containsKey("disponibilita")) {
-                        for (int c = 0; c < cellValues.size(); c++) {
-                            String col = normalizeExcelHeaderCell(cellValues.get(c));
-                            if (col != null && col.equals("disponibilita")) {
-                                headerToIndex.put("disponibilita", c);
-                                break;
+                        // Cerca "CS" nella riga header e nelle righe successive (header su più righe)
+                        for (int scanR = i; scanR < Math.min(i + 35, rows.getLength()) && !headerToIndex.containsKey("disponibilita"); scanR++) {
+                            Element scanRow = (Element) rows.item(scanR);
+                            List<String> scanCells = extractRowCells(scanRow);
+                            for (int c = 0; c < scanCells.size(); c++) {
+                                String cellVal = scanCells.get(c);
+                                if (cellVal == null) continue;
+                                String norm = cellVal.trim().replaceAll("[\\s\\u00A0._-]+", "").replaceAll("\\p{M}", "");
+                                String col = normalizeExcelHeaderCell(cellVal);
+                                if ((col != null && col.equals("disponibilita")) || norm.equalsIgnoreCase("cs")) {
+                                    headerToIndex.put("disponibilita", c);
+                                    break;
+                                }
                             }
                         }
-                        // Fallback: colonna CS (indice 96) per disponibilità
-                        if (!headerToIndex.containsKey("disponibilita") && cellValues.size() > COLONNA_CS_INDEX) {
+                        if (!headerToIndex.containsKey("disponibilita") && cellValues.size() > COLONNA_CS_ALTERNATIVA) {
+                            headerToIndex.put("disponibilita", COLONNA_CS_ALTERNATIVA);
+                        } else if (!headerToIndex.containsKey("disponibilita") && cellValues.size() > COLONNA_CS_INDEX) {
                             headerToIndex.put("disponibilita", COLONNA_CS_INDEX);
                         }
                     }
-                } else {
+                    headerRowIdx = i;
+                    continue;
+                }
+                {
+                    // Riga tipo "-EAN:8057284620150" sulla riga sotto al prodotto
+                    String eanFromRow = null;
+                    for (String cellVal : cellValues) {
+                        eanFromRow = extractEanFromString(cellVal);
+                        if (eanFromRow != null) break;
+                    }
+                    if (eanFromRow != null) {
+                        if (!result.isEmpty()) result.get(result.size() - 1).setEan(eanFromRow);
+                        continue;
+                    }
+
+
                     Integer skuIdx = headerToIndex.get("sku");
                     Integer nomeIdx = headerToIndex.get("nome_prodotto");
                     Integer catIdx = headerToIndex.get("categoria");
@@ -935,8 +1005,8 @@ public class ImportService {
                     Integer disponibilitaIdx = headerToIndex.get("disponibilita");
                     Integer eanIdx = headerToIndex.get("ean");
 
-                    String sku = cellValues.size() > skuIdx ? normalize(cellValues.get(skuIdx)) : null;
-                    String categoria = cellValues.size() > catIdx ? normalize(cellValues.get(catIdx)) : null;
+                    String sku = skuIdx != null && cellValues.size() > skuIdx ? normalize(cellValues.get(skuIdx)) : null;
+                    String categoria = catIdx != null && cellValues.size() > catIdx ? normalize(cellValues.get(catIdx)) : null;
                     if (sku == null && categoria == null) continue;
 
                     String nome = nomeIdx != null && cellValues.size() > nomeIdx ? normalize(cellValues.get(nomeIdx)) : null;
@@ -956,7 +1026,6 @@ public class ImportService {
                     dto.setDisponibilita(disponibilita);
                     result.add(dto);
                 }
-                rowIdx++;
             }
             return result;
         } catch (IllegalArgumentException e) {
@@ -1029,6 +1098,33 @@ public class ImportService {
         // Rimuove caratteri di combinazione (es. U+0332 underline) che possono impedire il match con "CS"
         col = col.replaceAll("\\p{M}", "");
         return aliasHeader(col);
+    }
+
+    /**
+     * Estrae EAN da riga tipo "-EAN:8057284620150" (EAN sulla riga sotto al prodotto).
+     * Scansiona tutte le celle della riga. Ritorna null se non trova il pattern.
+     */
+    private String extractEanFromRow(Row row, DataFormatter formatter) {
+        if (row == null) return null;
+        for (int c = 0; c < row.getLastCellNum(); c++) {
+            Cell cell = row.getCell(c);
+            if (cell == null) continue;
+            String raw = formatter.formatCellValue(cell);
+            String ean = extractEanFromString(raw);
+            if (ean != null) return ean;
+        }
+        return null;
+    }
+
+    /** Estrae EAN da stringa tipo "-EAN:8057284620150" o "EAN:8057284620150". Ritorna null se non valido. */
+    private String extractEanFromString(String raw) {
+        if (raw == null) return null;
+        raw = raw.trim();
+        if (raw.isEmpty()) return null;
+        // Cerca pattern EAN: o -EAN: seguito da cifre (anche in mezzo alla stringa)
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?i)-?EAN:\\s*(\\d{8,14})").matcher(raw);
+        if (m.find()) return m.group(1);
+        return null;
     }
 
     /** Legge una cella come stringa, gestendo celle null o sparse. Per .xls gestisce anche celle numeriche. */

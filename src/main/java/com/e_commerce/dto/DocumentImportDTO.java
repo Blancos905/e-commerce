@@ -6,8 +6,11 @@ import lombok.Data;
 @Data
 public class DocumentImportDTO {
 
-    @CsvBindByName(column = "sku", required = true)
+    @CsvBindByName(column = "sku")
     private String sku;
+
+    @CsvBindByName(column = "ean")
+    private String ean;
 
     @CsvBindByName(column = "tipo_documento", required = true)
     private String tipoDocumento;

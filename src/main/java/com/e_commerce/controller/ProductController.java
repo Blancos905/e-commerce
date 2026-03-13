@@ -7,9 +7,11 @@ import com.e_commerce.model.Category;
 import com.e_commerce.model.Document;
 import com.e_commerce.model.Product;
 import com.e_commerce.repository.CategoryRepository;
+import com.e_commerce.repository.DocumentRepository;
 import com.e_commerce.repository.ImportLogRepository;
 import com.e_commerce.service.IcecatService;
 import com.e_commerce.service.ImportService;
+import com.e_commerce.service.ProductMatchingService;
 import com.e_commerce.service.ProductService;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -29,28 +31,53 @@ public class ProductController {
 
     private final ProductService productService;
     private final CategoryRepository categoryRepository;
+    private final DocumentRepository documentRepository;
     private final ImportLogRepository importLogRepository;
     private final ImportService importService;
     private final IcecatService icecatService;
+    private final ProductMatchingService productMatchingService;
 
     public ProductController(ProductService productService,
                              CategoryRepository categoryRepository,
+                             DocumentRepository documentRepository,
                              ImportLogRepository importLogRepository,
                              ImportService importService,
-                             IcecatService icecatService) {
+                             IcecatService icecatService,
+                             ProductMatchingService productMatchingService) {
         this.productService = productService;
         this.categoryRepository = categoryRepository;
+        this.documentRepository = documentRepository;
         this.importLogRepository = importLogRepository;
         this.importService = importService;
         this.icecatService = icecatService;
+        this.productMatchingService = productMatchingService;
+    }
+
+    /** Test matching: GET /api/products/match?sku=xxx oppure ?ean=xxx */
+    @GetMapping("/match")
+    public ResponseEntity<?> testMatch(@RequestParam(required = false) String sku,
+                                       @RequestParam(required = false) String ean) {
+        var result = productMatchingService.findProduct(sku, ean);
+        if (result.isFound()) {
+            return ResponseEntity.ok(java.util.Map.of(
+                    "found", true,
+                    "matchType", result.matchType().name(),
+                    "productId", result.product().getId(),
+                    "productSku", result.product().getSku(),
+                    "productEan", result.product().getEan() != null ? result.product().getEan() : ""
+            ));
+        }
+        return ResponseEntity.ok(java.util.Map.of("found", false, "matchType", "NOT_FOUND"));
     }
 
     @GetMapping
     public List<Product> list(@RequestParam(required = false) String nome,
                               @RequestParam(required = false) String sku,
-                              @RequestParam(required = false) String categoria) {
-        if (nome != null || sku != null || categoria != null) {
-            return productService.search(nome, sku, categoria);
+                              @RequestParam(required = false) String ean,
+                              @RequestParam(required = false) String categoria,
+                              @RequestParam(required = false) String fornitore) {
+        if (nome != null || sku != null || ean != null || categoria != null || fornitore != null) {
+            return productService.search(nome, sku, ean, categoria, fornitore);
         }
         return productService.findAll();
     }
@@ -86,17 +113,128 @@ public class ProductController {
 
     @PostMapping("/{id}/sync-icecat-images")
     public ResponseEntity<?> syncIcecatImages(@PathVariable Long id) {
-        if (productService.findById(id).isEmpty()) {
+        var productOpt = productService.findById(id);
+        if (productOpt.isEmpty()) {
             return ResponseEntity.notFound().build();
         }
+        var product = productOpt.get();
+        String ean = product.getEan() != null ? product.getEan().trim() : product.getSku();
         int count = icecatService.syncImagesForProduct(id);
-        return ResponseEntity.ok(java.util.Map.of("imagesAdded", count));
+        String diagnoseMsg = null;
+        if (count == 0 && ean != null) {
+            var diag = icecatService.diagnose(ean);
+            diagnoseMsg = diag.message();
+        }
+        return ResponseEntity.ok(java.util.Map.of(
+                "imagesAdded", count,
+                "diagnoseMessage", diagnoseMsg != null ? diagnoseMsg : ""
+        ));
     }
 
     @PostMapping("/sync-all-icecat-images")
     public ResponseEntity<?> syncAllIcecatImages() {
         int total = icecatService.syncImagesForAllProducts();
         return ResponseEntity.ok(java.util.Map.of("imagesAdded", total));
+    }
+
+    /** Debug: testa Icecat per un EAN e restituisce quante immagini trovato (senza salvare). */
+    @GetMapping("/icecat-test")
+    public ResponseEntity<?> testIcecat(@RequestParam String ean) {
+        java.util.List<String> urls = icecatService.fetchImageUrls(ean);
+        return ResponseEntity.ok(java.util.Map.of(
+                "ean", ean,
+                "imagesFound", urls.size(),
+                "urls", urls
+        ));
+    }
+
+    /** Diagnostica Icecat: restituisce il motivo per cui non trova immagini (EAN, 401, prodotto assente, ecc.). */
+    @GetMapping("/icecat-diagnose")
+    public ResponseEntity<?> diagnoseIcecat(@RequestParam String ean) {
+        var diag = icecatService.diagnose(ean);
+        var map = new java.util.HashMap<String, Object>();
+        map.put("ean", diag.ean());
+        map.put("httpStatus", diag.httpStatus() != null ? diag.httpStatus() : "");
+        map.put("message", diag.message());
+        map.put("authConfigured", icecatService.isAuthConfigured());
+        return ResponseEntity.ok(map);
+    }
+
+    /** Diagnostica Icecat estesa: quando 0 immagini, include xmlPreview e debug per capire la risposta Icecat. */
+    @GetMapping("/icecat-diagnose-verbose")
+    public ResponseEntity<?> diagnoseIcecatVerbose(@RequestParam String ean) {
+        var diag = icecatService.diagnoseVerbose(ean);
+        var map = new java.util.HashMap<String, Object>();
+        map.put("ean", diag.ean());
+        map.put("httpStatus", diag.httpStatus() != null ? diag.httpStatus() : "");
+        map.put("message", diag.message());
+        map.put("imageUrls", diag.imageUrls());
+        if (diag.xmlPreview() != null) map.put("xmlPreview", diag.xmlPreview());
+        return ResponseEntity.ok(map);
+    }
+
+    /** Test connessione: stessa chiamata di Postman. Se Postman funziona ma questo no, copia le credenziali da Postman in application.properties. */
+    @GetMapping("/icecat-test-connection")
+    public ResponseEntity<?> icecatTestConnection(@RequestParam String ean) {
+        return ResponseEntity.ok(icecatService.testConnection(ean));
+    }
+
+    /** Debug: restituisce XML grezzo da Icecat per diagnostica (vedi cosa restituisce l'API). */
+    @GetMapping("/icecat-raw")
+    public ResponseEntity<?> icecatRawXml(@RequestParam String ean) {
+        String raw = icecatService.fetchRawXmlForDebug(ean);
+        return ResponseEntity.ok(java.util.Map.of("ean", ean, "rawXml", raw));
+    }
+
+    /** Aggiunge un documento (es. immagine) al prodotto tramite URL. Alternativa a Icecat. */
+    @PostMapping("/{id}/documents")
+    @Transactional
+    public ResponseEntity<?> addDocument(@PathVariable Long id, @RequestBody java.util.Map<String, String> body) {
+        String url = body != null ? body.get("url") : null;
+        String tipo = body != null && body.get("tipo") != null ? body.get("tipo").trim() : "immagine";
+        if (url == null || url.isBlank()) {
+            return ResponseEntity.badRequest().body("Campo 'url' obbligatorio.");
+        }
+        url = url.trim();
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return ResponseEntity.badRequest().body("L'URL deve iniziare con http:// o https://");
+        }
+        var productOpt = productService.findByIdWithAssociations(id);
+        if (productOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Product product = productOpt.get();
+        Document doc = new Document();
+        doc.setTipo(tipo);
+        doc.setUrl(url);
+        doc.setProduct(product);
+        documentRepository.save(doc);
+        product.getDocumenti().add(doc);
+        productService.save(product);
+        return ResponseEntity.ok(doc);
+    }
+
+    /** Rimuove un documento dal prodotto. */
+    @DeleteMapping("/{productId}/documents/{documentId}")
+    @Transactional
+    public ResponseEntity<Void> removeDocument(@PathVariable Long productId, @PathVariable Long documentId) {
+        var docOpt = documentRepository.findById(documentId);
+        if (docOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Document doc = docOpt.get();
+        if (doc.getProduct() == null || !doc.getProduct().getId().equals(productId)) {
+            return ResponseEntity.notFound().build();
+        }
+        documentRepository.delete(doc);
+        return ResponseEntity.noContent().build();
+    }
+
+    /** Restituisce il path assoluto della cartella storage Icecat. */
+    @GetMapping("/icecat-storage-path")
+    public ResponseEntity<?> getIcecatStoragePath() {
+        String path = icecatService.getStoragePathAbsolute();
+        return ResponseEntity.ok(java.util.Map.of("storagePath", path));
     }
 
     @GetMapping("/can-rollback-last-import")
