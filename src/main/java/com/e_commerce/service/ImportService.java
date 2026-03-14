@@ -253,6 +253,8 @@ public class ImportService {
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
             String eanVal = normalize(dto.getEan());
             product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
+            product.setMarca(truncate(normalize(dto.getMarca()), 128));
+            product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
             productService.save(product);
         }
     }
@@ -353,6 +355,8 @@ public class ImportService {
             }
 
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
+            product.setMarca(truncate(normalize(dto.getMarca()), 128));
+            product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
 
             productService.save(product);
             rowNumber++;
@@ -571,6 +575,7 @@ public class ImportService {
 
         StringBuilder normalized = new StringBuilder();
         String[] cols = header.split(java.util.regex.Pattern.quote(String.valueOf(separator)), -1);
+        java.util.Set<String> seen = new java.util.HashSet<>();
         for (int i = 0; i < cols.length; i++) {
             String col = cols[i];
             col = stripBom(col);
@@ -580,8 +585,15 @@ public class ImportService {
             }
             col = col.trim().toLowerCase();
             col = col.replaceAll("\\s+", "_");
-            col = aliasHeader(col);
-            normalized.append(col);
+            String mapped = aliasHeader(col);
+            if (mapped != null && !mapped.isBlank()) {
+                if (seen.contains(mapped)) {
+                    mapped = "__ignored_" + i;
+                } else {
+                    seen.add(mapped);
+                }
+            }
+            normalized.append(mapped != null ? mapped : "");
             if (i < cols.length - 1) {
                 normalized.append(separator);
             }
@@ -649,6 +661,10 @@ public class ImportService {
             // prodotti - categoria
             case "category", "cat", "nome_categoria", "categoria_nome", "categories", "category_name",
                     "categoria_prodotto", "macrocategoria", "tipologia", "famiglia" -> "categoria";
+            // marca / brand (per fallback Icecat prod_id+vendor)
+            case "marca", "brand", "vendor", "fabricante", "manufacturer" -> "marca";
+            case "codice_produttore", "codiceproduttore", "prod_id", "product_id", "cod_produttore",
+                    "codice_prodotto", "codice_produttore_icecat" -> "codice_produttore";
 
             // prodotti - disponibilità (stessa logica del prezzo: molti alias per file diversi)
             case "cs", "c.s.", "c_s", "c.s", "cs.", "cs_cosenza", "cs_(cosenza)", "cs_(c)",
@@ -797,6 +813,8 @@ public class ImportService {
                 Integer prezzoIdx = headerToIndex.get("prezzo");
                 Integer disponibilitaIdx = headerToIndex.get("disponibilita");
                 Integer eanIdx = headerToIndex.get("ean");
+                Integer marcaIdx = headerToIndex.get("marca");
+                Integer codiceProduttoreIdx = headerToIndex.get("codice_produttore");
                 int firstDataRow = headerRow.getRowNum() + (usedSubHeader ? 2 : 1);
                 // Controllo esplicito colonna 33 (formato con molte colonne: Category,Brand,Codice,...,CS,PZ)
                 if (headerRow.getLastCellNum() > COLONNA_CS_ALTERNATIVA) {
@@ -872,6 +890,8 @@ public class ImportService {
                     }
                     String disponibilita = readCellAsString(row, disponibilitaIdx, formatter);
                     String ean = eanIdx != null ? readCellAsString(row, eanIdx, formatter) : null;
+                    String marca = marcaIdx != null ? readCellAsString(row, marcaIdx, formatter) : null;
+                    String codiceProduttore = codiceProduttoreIdx != null ? readCellAsString(row, codiceProduttoreIdx, formatter) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
@@ -880,6 +900,8 @@ public class ImportService {
                     dto.setNomeCategoria(categoria);
                     dto.setPrezzoBase(prezzo);
                     dto.setDisponibilita(disponibilita);
+                    dto.setMarca(marca);
+                    dto.setCodiceProduttore(codiceProduttore);
                     rows.add(dto);
                 }
                 return rows;
@@ -1004,6 +1026,8 @@ public class ImportService {
                     Integer prezzoIdx = headerToIndex.get("prezzo");
                     Integer disponibilitaIdx = headerToIndex.get("disponibilita");
                     Integer eanIdx = headerToIndex.get("ean");
+                    Integer marcaIdx = headerToIndex.get("marca");
+                    Integer codiceProduttoreIdx = headerToIndex.get("codice_produttore");
 
                     String sku = skuIdx != null && cellValues.size() > skuIdx ? normalize(cellValues.get(skuIdx)) : null;
                     String categoria = catIdx != null && cellValues.size() > catIdx ? normalize(cellValues.get(catIdx)) : null;
@@ -1016,10 +1040,14 @@ public class ImportService {
                     }
                     String disponibilita = disponibilitaIdx != null && cellValues.size() > disponibilitaIdx ? normalize(cellValues.get(disponibilitaIdx)) : null;
                     String ean = eanIdx != null && cellValues.size() > eanIdx ? normalize(cellValues.get(eanIdx)) : null;
+                    String marca = marcaIdx != null && cellValues.size() > marcaIdx ? normalize(cellValues.get(marcaIdx)) : null;
+                    String codiceProduttore = codiceProduttoreIdx != null && cellValues.size() > codiceProduttoreIdx ? normalize(cellValues.get(codiceProduttoreIdx)) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
                     dto.setEan(ean);
+                    dto.setMarca(marca);
+                    dto.setCodiceProduttore(codiceProduttore);
                     dto.setNome(nome);
                     dto.setNomeCategoria(categoria);
                     dto.setPrezzoBase(prezzo);

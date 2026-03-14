@@ -132,6 +132,10 @@ public class ProductService {
                             ? req.getDisponibilita().trim() : null);
                     existing.setEan(req.getEan() != null && !req.getEan().trim().isEmpty()
                             ? req.getEan().trim() : null);
+                    existing.setMarca(req.getMarca() != null && !req.getMarca().trim().isEmpty()
+                            ? req.getMarca().trim() : null);
+                    existing.setCodiceProduttore(req.getCodiceProduttore() != null && !req.getCodiceProduttore().trim().isEmpty()
+                            ? req.getCodiceProduttore().trim() : null);
                     existing.setPrezzoBase(req.getPrezzoBase());
                     existing.setAumentoPercentuale(req.getAumentoPercentuale());
                     if (req.getCategoriaId() != null) {

@@ -22,6 +22,14 @@ public class Product {
     @Column(length = 32)
     private String ean;
 
+    /** Marca/vendor per fallback Icecat (prod_id + vendor quando EAN non trova risultati) */
+    @Column(length = 128)
+    private String marca;
+
+    /** Codice produttore (prod_id Icecat) per fallback con marca */
+    @Column(length = 64)
+    private String codiceProduttore;
+
     @Column(nullable = false)
     private String nome;
 
@@ -57,5 +65,6 @@ public class Product {
 
     @BatchSize(size = 50)
     @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true)
+    @OrderBy("ordine ASC")
     private List<Document> documenti = new ArrayList<>();
 }

@@ -16,6 +16,10 @@ public class ProductUpdateRequest {
 
     private String ean;
 
+    private String marca;
+
+    private String codiceProduttore;
+
     private BigDecimal prezzoBase;
 
     private Double aumentoPercentuale;

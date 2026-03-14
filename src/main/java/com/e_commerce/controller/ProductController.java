@@ -204,14 +204,47 @@ public class ProductController {
             return ResponseEntity.notFound().build();
         }
         Product product = productOpt.get();
+        int maxOrdine = product.getDocumenti().stream()
+                .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
+                .max(Integer::compareTo)
+                .orElse(-1);
         Document doc = new Document();
         doc.setTipo(tipo);
         doc.setUrl(url);
+        doc.setOrdine(maxOrdine + 1);
         doc.setProduct(product);
         documentRepository.save(doc);
         product.getDocumenti().add(doc);
         productService.save(product);
         return ResponseEntity.ok(doc);
+    }
+
+    /** Imposta un documento come immagine principale (ordine 0). Le altre immagini vengono riordinate. */
+    @PutMapping("/{productId}/documents/{documentId}/set-as-main")
+    @Transactional
+    public ResponseEntity<?> setDocumentAsMain(@PathVariable Long productId, @PathVariable Long documentId) {
+        var docOpt = documentRepository.findById(documentId);
+        if (docOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Document doc = docOpt.get();
+        if (doc.getProduct() == null || !doc.getProduct().getId().equals(productId)) {
+            return ResponseEntity.notFound().build();
+        }
+        Product product = productService.findByIdWithAssociations(productId).orElse(null);
+        if (product == null) {
+            return ResponseEntity.notFound().build();
+        }
+        int ord = 1;
+        for (Document d : product.getDocumenti()) {
+            if (d.getId().equals(documentId)) {
+                d.setOrdine(0);
+            } else {
+                d.setOrdine(ord++);
+            }
+        }
+        documentRepository.saveAll(product.getDocumenti());
+        return ResponseEntity.ok().build();
     }
 
     /** Rimuove un documento dal prodotto. */

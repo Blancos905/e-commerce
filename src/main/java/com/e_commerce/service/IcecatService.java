@@ -13,9 +13,11 @@ import jakarta.annotation.PostConstruct;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.file.Files;
@@ -49,6 +51,9 @@ public class IcecatService {
 
     private static final Logger log = LoggerFactory.getLogger(IcecatService.class);
     private static final String ICECAT_API = "https://data.icecat.biz/xml_s3/xml_server3.cgi";
+    private static final String ICECAT_INDEX_OPEN = "https://data.icecat.biz/export/freexml";
+    private static final String ICECAT_INDEX_FULL = "https://data.icecat.biz/export/level4";
+    private static final int MAX_IMAGES_PER_PRODUCT = 3;
 
     private final ProductRepository productRepository;
     private final DocumentRepository documentRepository;
@@ -217,6 +222,244 @@ public class IcecatService {
             log.warn("Icecat: errore per EAN {}: {}", normalized, e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Recupera XML prodotto da Icecat tramite vendor (marca) + prod_id (codice produttore).
+     * Usato come fallback quando la ricerca per EAN non restituisce risultati.
+     */
+    public IcecatData fetchProductDataByBrandAndProdId(String vendor, String prodId) {
+        if (vendor == null || vendor.isBlank() || prodId == null || prodId.isBlank()) {
+            return null;
+        }
+        String v = vendor.trim();
+        String p = prodId.trim().toUpperCase();
+        String url = ICECAT_API + "?lang=" + lang + "&vendor=" + URLEncoder.encode(v, StandardCharsets.UTF_8)
+                + "&prod_id=" + URLEncoder.encode(p, StandardCharsets.UTF_8) + "&output=productxml";
+
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .build();
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(30))
+                    .header("Accept", "application/xml, text/xml, */*")
+                    .header("Accept-Language", lang != null ? lang : "IT")
+                    .GET();
+
+            if (username != null && !username.isBlank() && password != null && !password.isBlank()) {
+                String auth = java.util.Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
+                builder.header("Authorization", "Basic " + auth);
+            }
+
+            HttpResponse<byte[]> responseBytes = client.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            int status = responseBytes.statusCode();
+            byte[] bodyBytes = responseBytes.body();
+            String contentEncoding = responseBytes.headers().firstValue("Content-Encoding").orElse("");
+            byte[] raw = bodyBytes;
+            if (contentEncoding != null && contentEncoding.toLowerCase().contains("gzip") && bodyBytes != null && bodyBytes.length > 0) {
+                try (ByteArrayInputStream bais = new ByteArrayInputStream(bodyBytes);
+                     GZIPInputStream gzis = new GZIPInputStream(bais);
+                     ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                    byte[] buffer = new byte[8192];
+                    int len;
+                    while ((len = gzis.read(buffer)) > 0) {
+                        baos.write(buffer, 0, len);
+                    }
+                    raw = baos.toByteArray();
+                } catch (IOException e) {
+                    log.warn("Icecat: errore decompressione gzip (brand): {}", e.getMessage());
+                }
+            }
+            String xml = (raw != null && raw.length > 0)
+                    ? new String(raw, StandardCharsets.UTF_8)
+                    : "";
+
+            if (status == 401) {
+                log.warn("Icecat: 401 Unauthorized per vendor={} prod_id={}", v, p);
+                return null;
+            }
+            if (status != 200) {
+                log.debug("Icecat: API risposta {} per vendor={} prod_id={}", status, v, p);
+                return null;
+            }
+            if (xml == null || xml.isBlank()) return null;
+            if (xml.toLowerCase().contains("product not found") || xml.contains("NO_SUCH_PRODUCT") || xml.contains("no results")) {
+                return null;
+            }
+            if (xml.contains("Code=\"-1\"") || xml.contains("ErrorMessage=")) return null;
+
+            return parseIcecatDataFromXml(xml);
+        } catch (Exception e) {
+            log.debug("Icecat: errore per vendor={} prod_id={}: {}", v, p, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Recupera XML prodotto da Icecat tramite Icecat product ID.
+     */
+    public IcecatData fetchProductDataByIcecatId(long icecatId) {
+        String url = ICECAT_API + "?lang=" + lang + "&icecat_id=" + icecatId + "&output=productxml";
+        return fetchProductXmlFromUrl(url);
+    }
+
+    private IcecatData fetchProductXmlFromUrl(String url) {
+        try {
+            HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
+            HttpRequest.Builder builder = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(30))
+                    .header("Accept", "application/xml, text/xml, */*")
+                    .header("Accept-Language", lang != null ? lang : "IT")
+                    .GET();
+            if (username != null && !username.isBlank() && password != null && !password.isBlank()) {
+                String auth = java.util.Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
+                builder.header("Authorization", "Basic " + auth);
+            }
+            HttpResponse<byte[]> responseBytes = client.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+            int status = responseBytes.statusCode();
+            byte[] bodyBytes = responseBytes.body();
+            String contentEncoding = responseBytes.headers().firstValue("Content-Encoding").orElse("");
+            byte[] raw = bodyBytes;
+            if (contentEncoding != null && contentEncoding.toLowerCase().contains("gzip") && bodyBytes != null && bodyBytes.length > 0) {
+                try (ByteArrayInputStream bais = new ByteArrayInputStream(bodyBytes);
+                     GZIPInputStream gzis = new GZIPInputStream(bais);
+                     ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                    byte[] buffer = new byte[8192];
+                    int len;
+                    while ((len = gzis.read(buffer)) > 0) baos.write(buffer, 0, len);
+                    raw = baos.toByteArray();
+                } catch (IOException e) {
+                    log.warn("Icecat: errore decompressione gzip: {}", e.getMessage());
+                }
+            }
+            String xml = (raw != null && raw.length > 0) ? new String(raw, StandardCharsets.UTF_8) : "";
+            if (status != 200 || xml == null || xml.isBlank()) return null;
+            if (xml.toLowerCase().contains("product not found") || xml.contains("NO_SUCH_PRODUCT") || xml.contains("no results")) return null;
+            if (xml.contains("Code=\"-1\"") || xml.contains("ErrorMessage=")) return null;
+            return parseIcecatDataFromXml(xml);
+        } catch (Exception e) {
+            log.debug("Icecat: errore fetch URL: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Cerca nell'indice Icecat per nome prodotto (model_name) e recupera il primo match.
+     * Usato come fallback quando EAN non restituisce risultati.
+     */
+    public IcecatData fetchProductDataByProductName(String productName) {
+        if (productName == null || productName.isBlank()) return null;
+        String searchTerm = productName.trim().toLowerCase().replaceAll("\\s+", " ").replaceAll("[^a-z0-9\\s-]", "");
+        if (searchTerm.length() < 3) return null;
+
+        String langCode = (lang != null && !lang.isBlank()) ? lang : "IT";
+        String baseUrl = (username != null && !username.isBlank() && password != null && !password.isBlank())
+                ? ICECAT_INDEX_FULL : ICECAT_INDEX_OPEN;
+        String indexUrl = baseUrl + "/" + langCode + "/files.index.csv.gz";
+
+        try {
+            HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL)
+                    .connectTimeout(java.time.Duration.ofSeconds(30))
+                    .build();
+            HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
+                    .uri(URI.create(indexUrl))
+                    .timeout(java.time.Duration.ofSeconds(120))
+                    .GET();
+            if (username != null && !username.isBlank() && password != null && !password.isBlank()) {
+                String auth = java.util.Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
+                reqBuilder.header("Authorization", "Basic " + auth);
+            }
+            HttpResponse<java.io.InputStream> response = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofInputStream());
+            if (response.statusCode() != 200) {
+                log.debug("Icecat: index non scaricabile {} per {}", response.statusCode(), indexUrl);
+                return null;
+            }
+
+            int modelNameIdx = -1;
+            int vendorIdx = -1;
+            int prodIdIdx = -1;
+            int productIdIdx = -1;
+
+            try (GZIPInputStream gz = new GZIPInputStream(response.body());
+                 BufferedReader reader = new BufferedReader(new InputStreamReader(gz, StandardCharsets.UTF_8))) {
+                String headerLine = reader.readLine();
+                if (headerLine == null) return null;
+                String[] headers = parseCsvLine(headerLine);
+                for (int i = 0; i < headers.length; i++) {
+                    String h = headers[i].trim().toLowerCase();
+                    if ("model_name".equals(h)) modelNameIdx = i;
+                    else if ("m_supplier_name".equals(h)) vendorIdx = i;
+                    else if ("prod_id".equals(h)) prodIdIdx = i;
+                    else if ("product_id".equals(h)) productIdIdx = i;
+                }
+                if (modelNameIdx < 0 || (vendorIdx < 0 && productIdIdx < 0)) return null;
+
+                int matchAttempts = 0;
+                final int maxAttempts = 10;
+                String line;
+                while ((line = reader.readLine()) != null && matchAttempts < maxAttempts) {
+                    String[] cols = parseCsvLine(line);
+                    if (modelNameIdx >= cols.length) continue;
+                    String modelName = cols[modelNameIdx];
+                    if (modelName == null || modelName.isBlank()) continue;
+                    String normModel = modelName.toLowerCase().replaceAll("\\s+", " ").replaceAll("[^a-z0-9\\s-]", "");
+                    String[] searchWords = searchTerm.split("\\s+");
+                    int matches = 0;
+                    for (String w : searchWords) {
+                        if (w.length() >= 2 && normModel.contains(w)) matches++;
+                    }
+                    if (matches >= Math.min(2, searchWords.length) || normModel.contains(searchTerm) || searchTerm.contains(normModel)) {
+                        matchAttempts++;
+                        if (productIdIdx >= 0 && productIdIdx < cols.length) {
+                            String pid = cols[productIdIdx];
+                            if (pid != null && !pid.isBlank() && pid.matches("\\d+")) {
+                                IcecatData d = fetchProductDataByIcecatId(Long.parseLong(pid.trim()));
+                                if (d != null && !d.imageUrls().isEmpty()) {
+                                    log.info("Icecat: trovato per nome '{}' via index (product_id={})", productName, pid);
+                                    return d;
+                                }
+                            }
+                        }
+                        if (vendorIdx >= 0 && prodIdIdx >= 0 && vendorIdx < cols.length && prodIdIdx < cols.length) {
+                            String v = cols[vendorIdx];
+                            String p = cols[prodIdIdx];
+                            if (v != null && !v.isBlank() && p != null && !p.isBlank()) {
+                                IcecatData d = fetchProductDataByBrandAndProdId(v.trim(), p.trim());
+                                if (d != null && !d.imageUrls().isEmpty()) {
+                                    log.info("Icecat: trovato per nome '{}' via index (vendor={} prod_id={})", productName, v, p);
+                                    return d;
+                                }
+                            }
+                        }
+                        // continua a cercare altre righe nell'indice (potrebbero esserci più match)
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Icecat: ricerca per nome fallita: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /** Parsing CSV semplificato: supporta virgolette. */
+    private String[] parseCsvLine(String line) {
+        if (line == null) return new String[0];
+        java.util.List<String> result = new java.util.ArrayList<>();
+        boolean inQuotes = false;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '"') inQuotes = !inQuotes;
+            else if (c == ',' && !inQuotes) {
+                result.add(sb.toString().replaceAll("^\"|\"$", "").trim());
+                sb.setLength(0);
+            } else sb.append(c);
+        }
+        result.add(sb.toString().replaceAll("^\"|\"$", "").trim());
+        return result.toArray(new String[0]);
     }
 
     private IcecatData parseIcecatDataFromXml(String xml) {
@@ -409,12 +652,31 @@ public class IcecatService {
 
         String eanRaw = product.getEan() != null ? product.getEan().trim() : product.getSku();
         String ean = resolveEanForLookup(eanRaw);
-        if (ean == null) {
-            log.info("Icecat: prodotto {} senza EAN valido (ean={}, sku={})", productId, product.getEan(), product.getSku());
+        IcecatData data = null;
+        if (ean != null) {
+            data = fetchProductData(eanRaw);
+        }
+        if (data == null || data.imageUrls().isEmpty()) {
+            String nome = product.getNome() != null ? product.getNome().trim() : null;
+            if (nome != null && nome.length() >= 3) {
+                log.info("Icecat: nessun risultato per EAN {}, fallback su nome prodotto '{}'", ean != null ? ean : "n/d", nome);
+                data = fetchProductDataByProductName(nome);
+            }
+        }
+        if (data == null || data.imageUrls().isEmpty()) {
+            String marca = product.getMarca() != null ? product.getMarca().trim() : null;
+            String codiceProduttore = product.getCodiceProduttore() != null ? product.getCodiceProduttore().trim() : null;
+            if (marca != null && !marca.isBlank() && codiceProduttore != null && !codiceProduttore.isBlank()) {
+                log.info("Icecat: nessun risultato per EAN/nome, fallback su marca={} codiceProduttore={}", marca, codiceProduttore);
+                data = fetchProductDataByBrandAndProdId(marca, codiceProduttore);
+            }
+        }
+        if (data == null || data.imageUrls().isEmpty()) {
+            if (ean == null) {
+                log.info("Icecat: prodotto {} senza risultati (EAN valido/marca+codice/nome)", productId);
+            }
             return 0;
         }
-        IcecatData data = fetchProductData(eanRaw);
-        if (data == null || data.imageUrls().isEmpty()) return 0;
 
         // Rimuovi vecchie immagini (Icecat URL o locali)
         List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
@@ -425,14 +687,16 @@ public class IcecatService {
             documentRepository.delete(d);
         }
 
-        // Scarica immagini e salva path locale
+        // Scarica immagini e salva path locale (max 3, ordine 0, 1, 2 per poter scegliere la principale)
         int added = 0;
-        for (int i = 0; i < data.imageUrls().size(); i++) {
+        int limit = Math.min(data.imageUrls().size(), MAX_IMAGES_PER_PRODUCT);
+        for (int i = 0; i < limit; i++) {
             String localPath = downloadImageToStorage(data.imageUrls().get(i), productId, i);
             if (localPath != null) {
                 Document doc = new Document();
                 doc.setTipo("immagine");
                 doc.setUrl(localPath);
+                doc.setOrdine(i);
                 doc.setProduct(product);
                 documentRepository.save(doc);
                 product.getDocumenti().add(doc);

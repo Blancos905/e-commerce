@@ -12,8 +12,11 @@ public class Document {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    private String tipo; // manuale, scheda_tecnica, ecc.
+    private String tipo; // manuale, scheda_tecnica, immagine, ecc.
     private String url;
+
+    /** Ordine di visualizzazione (0 = principale). Usato per scegliere quale immagine mostrare per prima. */
+    private Integer ordine;
 
     @ManyToOne
     @JoinColumn(name = "product_id")
