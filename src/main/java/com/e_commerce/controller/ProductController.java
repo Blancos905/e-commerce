@@ -2,6 +2,7 @@ package com.e_commerce.controller;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.e_commerce.dto.AppliedImportDTO;
 import com.e_commerce.dto.ProductUpdateRequest;
 import com.e_commerce.model.Category;
 import com.e_commerce.model.Document;
@@ -9,9 +10,11 @@ import com.e_commerce.model.Product;
 import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.DocumentRepository;
 import com.e_commerce.repository.ImportLogRepository;
+import com.e_commerce.dto.ProductRevisionDTO;
 import com.e_commerce.service.IcecatService;
 import com.e_commerce.service.ImportService;
 import com.e_commerce.service.ProductMatchingService;
+import com.e_commerce.service.ProductRevisionService;
 import com.e_commerce.service.ProductService;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -36,6 +39,7 @@ public class ProductController {
     private final ImportService importService;
     private final IcecatService icecatService;
     private final ProductMatchingService productMatchingService;
+    private final ProductRevisionService productRevisionService;
 
     public ProductController(ProductService productService,
                              CategoryRepository categoryRepository,
@@ -43,7 +47,8 @@ public class ProductController {
                              ImportLogRepository importLogRepository,
                              ImportService importService,
                              IcecatService icecatService,
-                             ProductMatchingService productMatchingService) {
+                             ProductMatchingService productMatchingService,
+                             ProductRevisionService productRevisionService) {
         this.productService = productService;
         this.categoryRepository = categoryRepository;
         this.documentRepository = documentRepository;
@@ -51,6 +56,7 @@ public class ProductController {
         this.importService = importService;
         this.icecatService = icecatService;
         this.productMatchingService = productMatchingService;
+        this.productRevisionService = productRevisionService;
     }
 
     /** Test matching: GET /api/products/match?sku=xxx oppure ?ean=xxx */
@@ -93,6 +99,39 @@ public class ProductController {
         return productService.updateProduct(id, updated)
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** Cronologia modifiche del singolo prodotto. */
+    /** Cronologia modifiche globale (tutti i prodotti modificati). */
+    @GetMapping("/all-revisions")
+    public ResponseEntity<List<ProductRevisionDTO>> getAllRevisions() {
+        return ResponseEntity.ok(productRevisionService.getAllRevisions());
+    }
+
+    @GetMapping("/{id}/revisions")
+    public ResponseEntity<List<ProductRevisionDTO>> getRevisions(@PathVariable Long id) {
+        if (productService.findById(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(productRevisionService.getRevisions(id));
+    }
+
+    /**
+     * Ripristina il prodotto a una versione precedente e rimuove la revisione dalla cronologia.
+     * Se il prodotto non esiste più, elimina comunque la revisione orfana e ritorna 200.
+     */
+    @PostMapping("/{id}/revert/{revisionId}")
+    @Transactional
+    public ResponseEntity<?> revertToRevision(@PathVariable Long id, @PathVariable Long revisionId) {
+        var opt = productRevisionService.revertToRevision(id, revisionId);
+        if (opt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        var r = opt.get();
+        if (r.product() != null) {
+            return ResponseEntity.ok(r.product());
+        }
+        return ResponseEntity.ok(java.util.Map.of("reverted", false, "revisionDeleted", true));
     }
 
     @DeleteMapping("/{id}")
@@ -275,6 +314,14 @@ public class ProductController {
     public ResponseEntity<Boolean> canRollbackLastImport() {
         boolean canRollback = importLogRepository.existsAppliedImportWithSnapshot();
         return ResponseEntity.ok(canRollback);
+    }
+
+    /** Elenco degli import applicati al catalogo, ordinati per data (più recente per primo). */
+    @GetMapping("/applied-imports")
+    @Transactional(readOnly = true)
+    public ResponseEntity<List<AppliedImportDTO>> listAppliedImports() {
+        List<AppliedImportDTO> list = importLogRepository.findAppliedImportsOrderByAppliedAtDesc();
+        return ResponseEntity.ok(list);
     }
 
     @PostMapping("/rollback-last-import")

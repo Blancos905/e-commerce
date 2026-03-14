@@ -7,6 +7,7 @@ import com.e_commerce.model.Product;
 import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.PriceSettingsRepository;
 import com.e_commerce.repository.ProductRepository;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -23,15 +24,18 @@ public class ProductService {
     private final PriceSettingsRepository priceSettingsRepository;
     private final PriceService priceService;
     private final CategoryRepository categoryRepository;
+    private final ProductRevisionService productRevisionService;
 
     public ProductService(ProductRepository productRepository,
                           PriceSettingsRepository priceSettingsRepository,
                           PriceService priceService,
-                          CategoryRepository categoryRepository) {
+                          CategoryRepository categoryRepository,
+                          @Lazy ProductRevisionService productRevisionService) {
         this.productRepository = productRepository;
         this.priceSettingsRepository = priceSettingsRepository;
         this.priceService = priceService;
         this.categoryRepository = categoryRepository;
+        this.productRevisionService = productRevisionService;
     }
 
     public List<Product> findAll() {
@@ -126,6 +130,7 @@ public class ProductService {
     public Optional<Product> updateProduct(Long id, ProductUpdateRequest req) {
         return productRepository.findByIdWithAssociations(id)
                 .map(existing -> {
+                    productRevisionService.saveRevisionBeforeUpdate(existing);
                     existing.setNome(req.getNome());
                     existing.setDescrizione(req.getDescrizione());
                     existing.setDisponibilita(req.getDisponibilita() != null && !req.getDisponibilita().trim().isEmpty()

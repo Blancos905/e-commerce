@@ -33,5 +33,21 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
     @Query("SELECT CASE WHEN COUNT(l.id) > 0 THEN true ELSE false END FROM ImportLog l " +
             "WHERE l.appliedAt IS NOT NULL AND l.previousStateJson IS NOT NULL")
     boolean existsAppliedImportWithSnapshot();
+
+    @Query("""
+            select new com.e_commerce.dto.AppliedImportDTO(
+                l.id,
+                l.fileName,
+                l.appliedAt,
+                l.supplier.id,
+                l.supplier.nome
+            )
+            from ImportLog l
+            where l.tipo = 'PRODOTTI'
+              and l.appliedAt is not null
+              and l.previousStateJson is not null
+            order by l.appliedAt desc
+            """)
+    List<com.e_commerce.dto.AppliedImportDTO> findAppliedImportsOrderByAppliedAtDesc();
 }
 

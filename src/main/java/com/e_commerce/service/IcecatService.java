@@ -160,8 +160,15 @@ public class IcecatService {
             log.info("Icecat: EAN non valido (estrai 8-14 cifre da ean/sku): {}", ean);
             return null;
         }
+        IcecatData data = fetchProductDataWithLang(ean, normalized, lang != null ? lang : "IT");
+        if (data == null) {
+            data = fetchProductDataWithLang(ean, normalized, "EN");
+        }
+        return data;
+    }
 
-        String url = ICECAT_API + "?lang=" + lang + "&ean_upc=" + URLEncoder.encode(normalized, StandardCharsets.UTF_8) + "&output=productxml";
+    private IcecatData fetchProductDataWithLang(String ean, String normalized, String langParam) {
+        String url = ICECAT_API + "?lang=" + langParam + "&ean_upc=" + URLEncoder.encode(normalized, StandardCharsets.UTF_8) + "&output=productxml";
 
         try {
             HttpClient client = HttpClient.newBuilder()
@@ -207,16 +214,12 @@ public class IcecatService {
                 log.warn("Icecat: 401 Unauthorized per EAN {}. Verifica credenziali Full Icecat.", normalized);
                 return null;
             }
-            if (status != 200) {
-                log.info("Icecat: API risposta {} per EAN {}", status, normalized);
-                return null;
-            }
+            if (status != 200) return null;
             if (xml == null || xml.isBlank()) return null;
-            if (xml.toLowerCase().contains("product not found") || xml.contains("NO_SUCH_PRODUCT") || xml.contains("no results")) {
+            if (xml.toLowerCase().contains("product not found") || xml.contains("NO_SUCH_PRODUCT") || xml.contains("no results")
+                    || xml.contains("Code=\"-1\"") || xml.contains("ErrorMessage=")) {
                 return null;
             }
-            if (xml.contains("Code=\"-1\"") || xml.contains("ErrorMessage=")) return null;
-
             return parseIcecatDataFromXml(xml);
         } catch (Exception e) {
             log.warn("Icecat: errore per EAN {}: {}", normalized, e.getMessage());
@@ -652,14 +655,16 @@ public class IcecatService {
 
         String eanRaw = product.getEan() != null ? product.getEan().trim() : product.getSku();
         String ean = resolveEanForLookup(eanRaw);
+        // Priorità: con EAN → EAN poi nome poi marca; senza EAN → nome poi marca
         IcecatData data = null;
         if (ean != null) {
+            log.info("Icecat: ricerca per EAN {}", ean);
             data = fetchProductData(eanRaw);
         }
         if (data == null || data.imageUrls().isEmpty()) {
             String nome = product.getNome() != null ? product.getNome().trim() : null;
             if (nome != null && nome.length() >= 3) {
-                log.info("Icecat: nessun risultato per EAN {}, fallback su nome prodotto '{}'", ean != null ? ean : "n/d", nome);
+                log.info("Icecat: nessun risultato per EAN, ricerca per nome '{}'", nome);
                 data = fetchProductDataByProductName(nome);
             }
         }
@@ -672,9 +677,7 @@ public class IcecatService {
             }
         }
         if (data == null || data.imageUrls().isEmpty()) {
-            if (ean == null) {
-                log.info("Icecat: prodotto {} senza risultati (EAN valido/marca+codice/nome)", productId);
-            }
+            log.info("Icecat: prodotto {} senza risultati (nome/EAN/marca+codice)", productId);
             return 0;
         }
 
@@ -722,14 +725,18 @@ public class IcecatService {
     }
 
     /**
-     * Sincronizza per tutti i prodotti con EAN valido.
+     * Sincronizza per tutti i prodotti con nome (≥3 caratteri) e/o EAN valido.
+     * Priorità: nome → EAN → marca+codiceProduttore.
      */
     public int syncImagesForAllProducts() {
         List<Product> products = productRepository.findAllWithAssociations();
         int total = 0;
         for (Product p : products) {
+            String nome = p.getNome() != null ? p.getNome().trim() : null;
             String eanRaw = p.getEan() != null ? p.getEan().trim() : p.getSku();
-            if (resolveEanForLookup(eanRaw) != null) {
+            boolean hasName = nome != null && nome.length() >= 3;
+            boolean hasEan = resolveEanForLookup(eanRaw) != null;
+            if (hasName || hasEan) {
                 total += syncImagesForProduct(p.getId());
             }
         }
