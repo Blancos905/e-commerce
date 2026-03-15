@@ -27,6 +27,8 @@ import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -50,6 +52,8 @@ import org.w3c.dom.NodeList;
 @Service
 public class ImportService {
 
+    private static final Logger log = LoggerFactory.getLogger(ImportService.class);
+
     /** Indice colonna Excel CS (97ª colonna, 0-based=96), usata spesso per disponibilità. */
     private static final int COLONNA_CS_INDEX = 96;
     /** Indice colonna CS in file con molte colonne – colonna AG (33ª colonna Excel, 0-based=32). */
@@ -64,6 +68,7 @@ public class ImportService {
     private final ImportLogRepository importLogRepository;
     private final ProductService productService;
     private final ProductMatchingService productMatchingService;
+    private final IcecatService icecatService;
 
     public ImportService(ProductRepository productRepository,
                          CategoryRepository categoryRepository,
@@ -71,7 +76,8 @@ public class ImportService {
                          SupplierRepository supplierRepository,
                          ImportLogRepository importLogRepository,
                          ProductService productService,
-                         ProductMatchingService productMatchingService) {
+                         ProductMatchingService productMatchingService,
+                         IcecatService icecatService) {
         this.productRepository = productRepository;
         this.categoryRepository = categoryRepository;
         this.documentRepository = documentRepository;
@@ -79,6 +85,7 @@ public class ImportService {
         this.importLogRepository = importLogRepository;
         this.productService = productService;
         this.productMatchingService = productMatchingService;
+        this.icecatService = icecatService;
     }
 
     public void importProducts(MultipartFile file, Long supplierId) throws Exception {
@@ -133,6 +140,23 @@ public class ImportService {
         log.setPreviousStateJson(mapper.writeValueAsString(snapshot));
         log.setAppliedAt(LocalDateTime.now());
         importLogRepository.save(log);
+
+        // Sincronizza automaticamente le immagini Icecat per i prodotti appena importati
+        for (ProductImportDTO dto : rows) {
+            String sku = normalize(dto.getSku());
+            if (sku == null) continue;
+            String skuTruncated = truncate(sku, 255);
+            productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
+                try {
+                    int added = icecatService.syncImagesForProduct(p.getId());
+                    if (added > 0) {
+                        ImportService.log.info("Import catalogo: Icecat ha aggiunto {} immagini per prodotto {} (SKU: {})", added, p.getId(), skuTruncated);
+                    }
+                } catch (Exception e) {
+                    ImportService.log.warn("Import catalogo: sync Icecat fallito per prodotto {} (SKU: {}): {}", p.getId(), skuTruncated, e.getMessage());
+                }
+            });
+        }
     }
 
     /**

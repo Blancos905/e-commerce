@@ -28,6 +28,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -349,14 +350,146 @@ public class IcecatService {
         }
     }
 
+    /** Candidato dall'indice Icecat con punteggio di similarità al nome cercato. */
+    private static final class IndexCandidate {
+        final String vendor;
+        final String prodId;
+        final String productId;
+        final String modelName;
+        final double score;
+
+        IndexCandidate(String vendor, String prodId, String productId, String modelName, double score) {
+            this.vendor = vendor;
+            this.prodId = prodId;
+            this.productId = productId;
+            this.modelName = modelName;
+            this.score = score;
+        }
+    }
+
     /**
-     * Cerca nell'indice Icecat per nome prodotto (model_name) e recupera il primo match.
-     * Usato come fallback quando EAN non restituisce risultati.
+     * Similarità tra due stringhe normalizzate (0 = nessuna, 1 = identiche).
+     * Basata su parole in comune e contenimento.
+     */
+    private double similarityScore(String searchTerm, String modelNameNormalized) {
+        if (searchTerm == null || modelNameNormalized == null) return 0;
+        if (modelNameNormalized.contains(searchTerm)) return 0.9 + (0.1 * searchTerm.length() / Math.max(1, modelNameNormalized.length()));
+        if (searchTerm.contains(modelNameNormalized)) return 0.7 + (0.2 * modelNameNormalized.length() / Math.max(1, searchTerm.length()));
+        String[] searchWords = searchTerm.split("\\s+");
+        String[] modelWords = modelNameNormalized.split("\\s+");
+        int match = 0;
+        for (String sw : searchWords) {
+            if (sw.length() < 1) continue;
+            if (sw.length() == 1 && !Character.isDigit(sw.charAt(0))) continue;
+            for (String mw : modelWords) {
+                if (mw.contains(sw) || sw.contains(mw)) { match++; break; }
+            }
+        }
+        if (match == 0) return 0;
+        double wordScore = (2.0 * match) / (searchWords.length + modelWords.length);
+        double lengthRatio = Math.min(searchTerm.length(), modelNameNormalized.length()) / (double) Math.max(searchTerm.length(), modelNameNormalized.length());
+        return 0.5 * wordScore + 0.3 * lengthRatio + 0.2 * (match >= searchWords.length ? 1 : (double) match / searchWords.length);
+    }
+
+    /** Normalizza per match: minuscolo, unifica spazi, rimuove spazi tra cifre e lettere (es. "5 mp" -> "5mp"). */
+    private String normalizeForMatch(String s) {
+        if (s == null) return "";
+        String n = s.trim().toLowerCase().replaceAll("\\s+", " ").replaceAll("[^a-z0-9\\s-]", "");
+        n = n.replaceAll("(\\d)\\s+(?=[a-z])", "$1").replaceAll("(?<=[a-z])\\s+(\\d)", "$1");
+        return n;
+    }
+
+    /**
+     * Genera molte varianti del nome per ricerca molto permissiva: nome completo, parole singole,
+     * sottostringhe, modelli, codici, prime N parole. Aggiunge coppie tipo "dome 5mp" per prodotti CCTV/telecamere.
+     */
+    private List<String> buildSearchVariants(String productName) {
+        List<String> variants = new ArrayList<>();
+        if (productName == null || productName.isBlank()) return variants;
+        String norm = normalizeForMatch(productName);
+        if (norm.length() < 1) return variants;
+        variants.add(norm);
+
+        String[] words = norm.split("\\s+");
+        for (String w : words) {
+            if (w.length() >= 2 && !variants.contains(w)) variants.add(w);
+        }
+        StringBuilder keyWords = new StringBuilder();
+        StringBuilder modelLike = new StringBuilder();
+        for (String w : words) {
+            if (w.length() < 2) continue;
+            if (w.matches(".*\\d+.*") || w.length() >= 3) keyWords.append(w).append(" ");
+            modelLike.append(w).append(" ");
+        }
+        String kw = keyWords.toString().trim();
+        if (kw.length() >= 2 && !variants.contains(kw)) variants.add(kw);
+        String ml = modelLike.toString().trim();
+        if (ml.length() >= 2 && !variants.contains(ml)) variants.add(ml);
+
+        for (int take = 2; take <= Math.min(5, words.length); take++) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < take && i < words.length; i++) {
+                if (words[i].length() >= 2) sb.append(words[i]).append(" ");
+            }
+            String f = sb.toString().trim();
+            if (f.length() >= 3 && !variants.contains(f)) variants.add(f);
+        }
+
+        if (norm.length() >= 6) {
+            String first = norm.substring(0, Math.min(8, norm.length()));
+            if (!variants.contains(first)) variants.add(first);
+        }
+        for (int i = 0; i < words.length; i++) {
+            for (int j = i + 1; j < words.length; j++) {
+                if (words[i].length() >= 2 && words[j].length() >= 2
+                        && (words[i].matches(".*\\d+.*") || words[j].matches(".*\\d+.*") || i < 3)) {
+                    String a = words[i] + " " + words[j];
+                    if (!variants.contains(a)) variants.add(a);
+                }
+            }
+        }
+        return variants;
+    }
+
+    /** Match molto permissivo: qualsiasi parola, sottostringa 3+ caratteri, o overlap minimo. */
+    private boolean isMatchForTerm(String searchTerm, String normModel) {
+        if (searchTerm == null || normModel == null) return false;
+        if (searchTerm.isEmpty() || normModel.isEmpty()) return false;
+        if (normModel.contains(searchTerm) || searchTerm.contains(normModel)) return true;
+        for (String w : searchTerm.split("\\s+")) {
+            if (w.length() >= 2 && normModel.contains(w)) return true;
+            if (w.length() == 1 && Character.isLetterOrDigit(w.charAt(0)) && normModel.contains(w)) return true;
+        }
+        for (int len = 3; len <= Math.min(12, searchTerm.length()); len++) {
+            for (int i = 0; i <= searchTerm.length() - len; i++) {
+                if (normModel.contains(searchTerm.substring(i, i + len))) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Match ultra-permissivo: qualsiasi overlap di 3+ caratteri (usato se pochi candidati). */
+    private boolean isMatchVeryPermissive(String searchTerm, String normModel) {
+        if (searchTerm == null || normModel == null) return false;
+        String s = searchTerm.replaceAll("\\s", "");
+        String m = normModel.replaceAll("\\s", "");
+        for (int len = 3; len <= Math.min(10, s.length()); len++) {
+            for (int i = 0; i <= s.length() - len; i++) {
+                if (m.contains(s.substring(i, i + len))) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Cerca nell'indice Icecat per nome prodotto (model_name). Se non trova un match esatto,
+     * raccoglie i candidati più simili (anche con varianti ridotte del nome), li ordina per similarità
+     * e prova fino a trovare un prodotto con immagini.
      */
     public IcecatData fetchProductDataByProductName(String productName) {
         if (productName == null || productName.isBlank()) return null;
-        String searchTerm = productName.trim().toLowerCase().replaceAll("\\s+", " ").replaceAll("[^a-z0-9\\s-]", "");
-        if (searchTerm.length() < 3) return null;
+        List<String> searchVariants = buildSearchVariants(productName);
+        if (searchVariants.isEmpty()) return null;
 
         String langCode = (lang != null && !lang.isBlank()) ? lang : "IT";
         String baseUrl = (username != null && !username.isBlank() && password != null && !password.isBlank())
@@ -369,7 +502,7 @@ public class IcecatService {
                     .build();
             HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(indexUrl))
-                    .timeout(java.time.Duration.ofSeconds(120))
+                    .timeout(java.time.Duration.ofSeconds(300))
                     .GET();
             if (username != null && !username.isBlank() && password != null && !password.isBlank()) {
                 String auth = java.util.Base64.getEncoder().encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
@@ -400,44 +533,66 @@ public class IcecatService {
                 }
                 if (modelNameIdx < 0 || (vendorIdx < 0 && productIdIdx < 0)) return null;
 
-                int matchAttempts = 0;
-                final int maxAttempts = 10;
+                List<IndexCandidate> candidates = new ArrayList<>();
+                Set<String> seenIds = new HashSet<>();
+                final int maxCandidates = 300;
+                final int maxLinesToScan = 800_000;
+                int linesRead = 0;
                 String line;
-                while ((line = reader.readLine()) != null && matchAttempts < maxAttempts) {
+
+                while ((line = reader.readLine()) != null && linesRead < maxLinesToScan) {
+                    linesRead++;
                     String[] cols = parseCsvLine(line);
                     if (modelNameIdx >= cols.length) continue;
                     String modelName = cols[modelNameIdx];
                     if (modelName == null || modelName.isBlank()) continue;
-                    String normModel = modelName.toLowerCase().replaceAll("\\s+", " ").replaceAll("[^a-z0-9\\s-]", "");
-                    String[] searchWords = searchTerm.split("\\s+");
-                    int matches = 0;
-                    for (String w : searchWords) {
-                        if (w.length() >= 2 && normModel.contains(w)) matches++;
+                    String normModel = normalizeForMatch(modelName);
+
+                    double bestScore = 0;
+                    for (String variant : searchVariants) {
+                        if (isMatchForTerm(variant, normModel)) {
+                            double s = similarityScore(variant, normModel);
+                            if (s > bestScore) bestScore = s;
+                        }
                     }
-                    if (matches >= Math.min(2, searchWords.length) || normModel.contains(searchTerm) || searchTerm.contains(normModel)) {
-                        matchAttempts++;
-                        if (productIdIdx >= 0 && productIdIdx < cols.length) {
-                            String pid = cols[productIdIdx];
-                            if (pid != null && !pid.isBlank() && pid.matches("\\d+")) {
-                                IcecatData d = fetchProductDataByIcecatId(Long.parseLong(pid.trim()));
-                                if (d != null && !d.imageUrls().isEmpty()) {
-                                    log.info("Icecat: trovato per nome '{}' via index (product_id={})", productName, pid);
-                                    return d;
-                                }
+                    if (bestScore <= 0) {
+                        for (String variant : searchVariants) {
+                            if (isMatchVeryPermissive(variant, normModel)) {
+                                bestScore = 0.15;
+                                break;
                             }
                         }
-                        if (vendorIdx >= 0 && prodIdIdx >= 0 && vendorIdx < cols.length && prodIdIdx < cols.length) {
-                            String v = cols[vendorIdx];
-                            String p = cols[prodIdIdx];
-                            if (v != null && !v.isBlank() && p != null && !p.isBlank()) {
-                                IcecatData d = fetchProductDataByBrandAndProdId(v.trim(), p.trim());
-                                if (d != null && !d.imageUrls().isEmpty()) {
-                                    log.info("Icecat: trovato per nome '{}' via index (vendor={} prod_id={})", productName, v, p);
-                                    return d;
-                                }
-                            }
+                    }
+                    if (bestScore <= 0) continue;
+
+                    String v = (vendorIdx >= 0 && vendorIdx < cols.length) ? (cols[vendorIdx] != null ? cols[vendorIdx].trim() : "") : "";
+                    String p = (prodIdIdx >= 0 && prodIdIdx < cols.length) ? (cols[prodIdIdx] != null ? cols[prodIdIdx].trim() : "") : "";
+                    String pid = (productIdIdx >= 0 && productIdIdx < cols.length) ? (cols[productIdIdx] != null ? cols[productIdIdx].trim() : "") : "";
+                    String dedupeKey = pid.matches("\\d+") ? ("id:" + pid) : ("v:" + v + "|p:" + p);
+                    if (seenIds.contains(dedupeKey)) continue;
+                    if (!pid.matches("\\d+") && (v.isEmpty() || p.isEmpty())) continue;
+                    seenIds.add(dedupeKey);
+
+                    candidates.add(new IndexCandidate(v, p, pid, modelName, bestScore));
+                    if (candidates.size() >= maxCandidates) break;
+                }
+
+                candidates.sort(Comparator.comparingDouble((IndexCandidate c) -> c.score).reversed());
+
+                for (IndexCandidate c : candidates) {
+                    if (c.productId != null && !c.productId.isEmpty() && c.productId.matches("\\d+")) {
+                        IcecatData d = fetchProductDataByIcecatId(Long.parseLong(c.productId));
+                        if (d != null && !d.imageUrls().isEmpty()) {
+                            log.info("Icecat: trovato per nome '{}' (più simile: '{}', score={})", productName, c.modelName, String.format("%.2f", c.score));
+                            return d;
                         }
-                        // continua a cercare altre righe nell'indice (potrebbero esserci più match)
+                    }
+                    if (c.vendor != null && !c.vendor.isEmpty() && c.prodId != null && !c.prodId.isEmpty()) {
+                        IcecatData d = fetchProductDataByBrandAndProdId(c.vendor, c.prodId);
+                        if (d != null && !d.imageUrls().isEmpty()) {
+                            log.info("Icecat: trovato per nome '{}' (più simile: '{}', score={})", productName, c.modelName, String.format("%.2f", c.score));
+                            return d;
+                        }
                     }
                 }
             }
@@ -663,14 +818,25 @@ public class IcecatService {
         }
         if (data == null || data.imageUrls().isEmpty()) {
             String nome = product.getNome() != null ? product.getNome().trim() : null;
+            String marca = product.getMarca() != null ? product.getMarca().trim() : null;
             if (nome != null && nome.length() >= 3) {
-                log.info("Icecat: nessun risultato per EAN, ricerca per nome '{}'", nome);
-                data = fetchProductDataByProductName(nome);
+                StringBuilder sb = new StringBuilder();
+                if (marca != null && !marca.isBlank()) sb.append(marca).append(" ");
+                sb.append(nome);
+                if (ean == null && eanRaw != null && eanRaw.matches("^[A-Za-z0-9_-]{4,32}$") && !nome.toLowerCase().contains(eanRaw.toLowerCase())) {
+                    sb.append(" ").append(eanRaw);
+                }
+                String searchName = sb.toString().trim();
+                log.info("Icecat: nessun risultato per EAN, ricerca per nome '{}'", searchName);
+                data = fetchProductDataByProductName(searchName);
             }
         }
         if (data == null || data.imageUrls().isEmpty()) {
             String marca = product.getMarca() != null ? product.getMarca().trim() : null;
             String codiceProduttore = product.getCodiceProduttore() != null ? product.getCodiceProduttore().trim() : null;
+            if ((codiceProduttore == null || codiceProduttore.isBlank()) && eanRaw != null && eanRaw.matches("^[A-Za-z0-9_-]{4,32}$")) {
+                codiceProduttore = eanRaw.trim();
+            }
             if (marca != null && !marca.isBlank() && codiceProduttore != null && !codiceProduttore.isBlank()) {
                 log.info("Icecat: nessun risultato per EAN/nome, fallback su marca={} codiceProduttore={}", marca, codiceProduttore);
                 data = fetchProductDataByBrandAndProdId(marca, codiceProduttore);

@@ -161,8 +161,12 @@ public class ProductController {
         int count = icecatService.syncImagesForProduct(id);
         String diagnoseMsg = null;
         if (count == 0 && ean != null) {
-            var diag = icecatService.diagnose(ean);
-            diagnoseMsg = diag.message();
+            if (ean.matches(".*\\d{8,14}.*") || ean.replaceAll("\\D", "").matches("\\d{8,14}")) {
+                var diag = icecatService.diagnose(ean);
+                diagnoseMsg = diag.message();
+            } else {
+                diagnoseMsg = "Codice alfanumerico: cercato per nome e marca+codice. Nessuna immagine trovata. Verifica nome e marca del prodotto.";
+            }
         }
         return ResponseEntity.ok(java.util.Map.of(
                 "imagesAdded", count,
