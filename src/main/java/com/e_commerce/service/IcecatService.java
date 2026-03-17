@@ -71,6 +71,12 @@ public class IcecatService {
     @Value("${icecat.storage-path:./storage/product-data}")
     private String storagePath;
 
+    @Value("${icecat.cache-path:./storage/icecat-cache}")
+    private String cachePath;
+
+    /** Path classpath dell'immagine di default (da public "immagine nn disponibile.png") */
+    private static final String DEFAULT_IMAGE_CLASSPATH = "/static/images/immagine-non-disponibile.png";
+
     public IcecatService(ProductRepository productRepository, DocumentRepository documentRepository) {
         this.productRepository = productRepository;
         this.documentRepository = documentRepository;
@@ -81,7 +87,9 @@ public class IcecatService {
         try {
             Path base = Paths.get(storagePath).toAbsolutePath();
             Files.createDirectories(base);
-            log.info("Icecat storage: {}", base);
+            Path cache = Paths.get(cachePath != null ? cachePath : "./storage/icecat-cache").toAbsolutePath();
+            Files.createDirectories(cache);
+            log.info("Icecat storage: {}, cache: {}", base, cache);
             boolean hasAuth = username != null && !username.isBlank() && password != null && !password.isBlank();
             log.info("Icecat auth: {} (user: {})", hasAuth ? "configurato" : "NON configurato - usa icecat.username e icecat.password in application.properties",
                     hasAuth ? username : "?");
@@ -150,6 +158,180 @@ public class IcecatService {
             log.warn("Errore download immagine {}: {}", imageUrl, e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Copia l'immagine di default dal classpath (static/images/immagine-non-disponibile.png)
+     * nella cartella storage del prodotto.
+     * @return path relativo per servire l'immagine o null se fallisce
+     */
+    private String copyDefaultImageToStorage(Long productId) {
+        try (java.io.InputStream is = getClass().getResourceAsStream(DEFAULT_IMAGE_CLASSPATH)) {
+            if (is == null) {
+                log.warn("Icecat: immagine di default non trovata nel classpath: {}", DEFAULT_IMAGE_CLASSPATH);
+                return null;
+            }
+            Path productDir = Paths.get(storagePath, String.valueOf(productId), "images");
+            Files.createDirectories(productDir);
+            String filename = "img_0.png";
+            Path filePath = productDir.resolve(filename);
+            Files.copy(is, filePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            return "/api/images/product/" + productId + "/" + filename;
+        } catch (IOException e) {
+            log.warn("Icecat: impossibile copiare immagine di default per prodotto {}: {}", productId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Chiave cache stabile: EAN > marca_codiceProduttore > sku.
+     * Usata per evitare re-download dopo reset catalogo o re-import.
+     */
+    private String getCacheKey(Product p) {
+        String ean = resolveEanForLookup(p.getEan() != null ? p.getEan().trim() : null);
+        if (ean != null) return sanitizeCacheKey("ean_" + ean);
+        String marca = p.getMarca() != null ? p.getMarca().trim() : "";
+        String codice = p.getCodiceProduttore() != null ? p.getCodiceProduttore().trim() : "";
+        if (!marca.isBlank() && !codice.isBlank()) {
+            return sanitizeCacheKey("brand_" + marca + "_" + codice);
+        }
+        String sku = p.getSku() != null ? p.getSku().trim() : "";
+        return sanitizeCacheKey("sku_" + (sku.isBlank() ? "unknown" : sku));
+    }
+
+    private String sanitizeCacheKey(String s) {
+        if (s == null) return "unknown";
+        return s.replaceAll("[\\\\/:*?\"<>|\\s]+", "_").replaceAll("_+", "_");
+    }
+
+    /**
+     * Copia immagini dalla cache al prodotto. Ritorna numero di immagini copiate o -1 se cache vuota.
+     */
+    private int copyFromCacheToProduct(Product product, String cacheKey) {
+        Path cacheDir = Paths.get(cachePath != null ? cachePath : "./storage/icecat-cache", cacheKey);
+        if (!Files.isDirectory(cacheDir)) return -1;
+        Path productDir = Paths.get(storagePath, String.valueOf(product.getId()), "images");
+        // Rimuovi vecchie immagini prima di copiare dalla cache
+        List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
+                .filter(d -> d.getTipo() != null && "immagine".equalsIgnoreCase(d.getTipo()))
+                .collect(Collectors.toList());
+        for (Document d : toRemove) {
+            product.getDocumenti().remove(d);
+            documentRepository.delete(d);
+        }
+        int count = 0;
+        for (int i = 0; i < MAX_IMAGES_PER_PRODUCT; i++) {
+            Path src = findImageByIndex(cacheDir, i);
+            if (src == null) break;
+            try {
+                Files.createDirectories(productDir);
+                String ext = src.getFileName().toString().substring(src.getFileName().toString().lastIndexOf('.'));
+                String filename = "img_" + i + ext;
+                Path dest = productDir.resolve(filename);
+                Files.copy(src, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                Document doc = new Document();
+                doc.setTipo("immagine");
+                doc.setUrl("/api/images/product/" + product.getId() + "/" + filename);
+                doc.setOrdine(i);
+                doc.setProduct(product);
+                documentRepository.save(doc);
+                product.getDocumenti().add(doc);
+                count++;
+            } catch (IOException e) {
+                log.warn("Icecat cache: errore copia img {} per prodotto {}: {}", i, product.getId(), e.getMessage());
+            }
+        }
+        if (count > 0) {
+            Path descFile = cacheDir.resolve("descrizione.txt");
+            if (Files.isRegularFile(descFile)) {
+                try {
+                    product.setDescrizione(Files.readString(descFile));
+                } catch (IOException e) {
+                    log.debug("Cache: descrizione non leggibile: {}", e.getMessage());
+                }
+            }
+        }
+        return count;
+    }
+
+    /** Copia l'immagine di default nella cache per riuso dopo reset. */
+    private void copyDefaultToCache(Long productId, String cacheKey) {
+        if (cacheKey == null) return;
+        try {
+            Path src = findImageByIndex(Paths.get(storagePath, String.valueOf(productId), "images"), 0);
+            if (src != null) {
+                Path cacheDir = Paths.get(cachePath != null ? cachePath : "./storage/icecat-cache", cacheKey);
+                Files.createDirectories(cacheDir);
+                Files.copy(src, cacheDir.resolve("img_0.png"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            log.debug("Cache: impossibile salvare default per {}: {}", cacheKey, e.getMessage());
+        }
+    }
+
+    /** Trova img_N.ext in una cartella (cache o product). */
+    private Path findImageByIndex(Path dir, int index) {
+        for (String ext : new String[]{"jpg", "jpeg", "png", "gif", "webp"}) {
+            Path p = dir.resolve("img_" + index + "." + ext);
+            if (Files.isRegularFile(p)) return p;
+        }
+        return null;
+    }
+
+    /**
+     * Copia le immagini appena scaricate dalla cartella prodotto alla cache.
+     */
+    private void copyProductImagesToCache(Long productId, String cacheKey, IcecatData data, int count) {
+        if (cacheKey == null || count <= 0) return;
+        try {
+            Path productDir = Paths.get(storagePath, String.valueOf(productId), "images");
+            Path cacheDir = Paths.get(cachePath != null ? cachePath : "./storage/icecat-cache", cacheKey);
+            Files.createDirectories(cacheDir);
+            for (int i = 0; i < count; i++) {
+                Path src = findImageByIndex(productDir, i);
+                if (src != null) {
+                    Files.copy(src, cacheDir.resolve(src.getFileName()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+            if (data.description() != null && !data.description().isBlank()) {
+                Files.writeString(cacheDir.resolve("descrizione.txt"), data.description(), StandardCharsets.UTF_8);
+            }
+        } catch (IOException e) {
+            log.warn("Icecat cache: impossibile salvare per {}: {}", cacheKey, e.getMessage());
+        }
+    }
+
+
+    /**
+     * Aggiunge l'immagine di default quando Icecat non trova immagini.
+     * Usa l'immagine "immagine non disponibile" da static/images.
+     */
+    private int addDefaultImageIfConfigured(Product product) {
+        Long productId = product.getId();
+        List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
+                .filter(d -> d.getTipo() != null && "immagine".equalsIgnoreCase(d.getTipo()))
+                .collect(Collectors.toList());
+        for (Document d : toRemove) {
+            product.getDocumenti().remove(d);
+            documentRepository.delete(d);
+        }
+        String localPath = copyDefaultImageToStorage(productId);
+        if (localPath != null) {
+            Document doc = new Document();
+            doc.setTipo("immagine");
+            doc.setUrl(localPath);
+            doc.setOrdine(0);
+            doc.setProduct(product);
+            documentRepository.save(doc);
+            product.getDocumenti().add(doc);
+            // Salva in cache per evitare re-copia da classpath dopo reset
+            copyDefaultToCache(productId, getCacheKey(product));
+            productRepository.save(product);
+            log.info("Icecat: immagine di default aggiunta per prodotto {} (SKU: {})", productId, product.getSku());
+            return 1;
+        }
+        log.warn("Icecat: impossibile copiare immagine di default per prodotto {}", productId);
+        return 0;
     }
 
     /**
@@ -802,11 +984,20 @@ public class IcecatService {
     }
 
     /**
-     * Sincronizza immagini e descrizione Icecat per un prodotto: scarica in storage e aggiorna DB.
+     * Sincronizza immagini e descrizione Icecat per un prodotto: prima controlla la cache,
+     * poi Icecat. La cache evita re-download dopo reset catalogo o re-import.
      */
     public int syncImagesForProduct(Long productId) {
         Product product = productRepository.findByIdWithAssociations(productId).orElse(null);
         if (product == null) return 0;
+
+        String cacheKey = getCacheKey(product);
+        int fromCache = copyFromCacheToProduct(product, cacheKey);
+        if (fromCache > 0) {
+            productRepository.save(product);
+            log.info("Icecat: {} immagini da cache per prodotto {} (SKU: {}, key: {})", fromCache, productId, product.getSku(), cacheKey);
+            return fromCache;
+        }
 
         String eanRaw = product.getEan() != null ? product.getEan().trim() : product.getSku();
         String ean = resolveEanForLookup(eanRaw);
@@ -843,8 +1034,8 @@ public class IcecatService {
             }
         }
         if (data == null || data.imageUrls().isEmpty()) {
-            log.info("Icecat: prodotto {} senza risultati (nome/EAN/marca+codice)", productId);
-            return 0;
+            log.info("Icecat: prodotto {} senza risultati (nome/EAN/marca+codice), uso immagine di default", productId);
+            return addDefaultImageIfConfigured(product);
         }
 
         // Rimuovi vecchie immagini (Icecat URL o locali)
@@ -885,8 +1076,11 @@ public class IcecatService {
             }
         }
 
+        // Salva in cache per evitare re-download dopo reset catalogo o re-import
+        copyProductImagesToCache(productId, cacheKey, data, added);
+
         productRepository.save(product);
-        log.info("Icecat: scaricate {} immagini e descrizione per prodotto {} (EAN {})", added, product.getSku(), ean);
+        log.info("Icecat: scaricate {} immagini e descrizione per prodotto {} (EAN {}), salvate in cache", added, product.getSku(), ean);
         return added;
     }
 

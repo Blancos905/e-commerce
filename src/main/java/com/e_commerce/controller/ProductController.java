@@ -13,6 +13,7 @@ import com.e_commerce.repository.ImportLogRepository;
 import com.e_commerce.dto.ProductRevisionDTO;
 import com.e_commerce.service.IcecatService;
 import com.e_commerce.service.ImportService;
+import com.e_commerce.service.MagentoService;
 import com.e_commerce.service.ProductMatchingService;
 import com.e_commerce.service.ProductRevisionService;
 import com.e_commerce.service.ProductService;
@@ -40,6 +41,7 @@ public class ProductController {
     private final IcecatService icecatService;
     private final ProductMatchingService productMatchingService;
     private final ProductRevisionService productRevisionService;
+    private final MagentoService magentoService;
 
     public ProductController(ProductService productService,
                              CategoryRepository categoryRepository,
@@ -48,7 +50,8 @@ public class ProductController {
                              ImportService importService,
                              IcecatService icecatService,
                              ProductMatchingService productMatchingService,
-                             ProductRevisionService productRevisionService) {
+                             ProductRevisionService productRevisionService,
+                             MagentoService magentoService) {
         this.productService = productService;
         this.categoryRepository = categoryRepository;
         this.documentRepository = documentRepository;
@@ -57,6 +60,7 @@ public class ProductController {
         this.icecatService = icecatService;
         this.productMatchingService = productMatchingService;
         this.productRevisionService = productRevisionService;
+        this.magentoService = magentoService;
     }
 
     /** Test matching: GET /api/products/match?sku=xxx oppure ?ean=xxx */
@@ -424,6 +428,34 @@ public class ProductController {
     @GetMapping("/export/json")
     public List<Product> exportJson() {
         return productService.findAll();
+    }
+
+    /**
+     * Esporta l'intero catalogo su Magento via REST API (OAuth 1.0a).
+     * Crea o aggiorna i prodotti su Magento in base allo SKU.
+     */
+    @PostMapping("/export/magento")
+    public ResponseEntity<?> exportToMagento() {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.base-url, consumer-key, consumer-secret, access-token, access-token-secret in application.properties"
+                    ));
+        }
+        List<Product> products = productService.findAll();
+        var result = magentoService.syncCatalog(products);
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of(
+                    "error", result.getError()
+            ));
+        }
+        var body = new java.util.HashMap<String, Object>();
+        body.put("created", result.getCreated());
+        body.put("updated", result.getUpdated());
+        body.put("skipped", result.getSkipped());
+        body.put("errorsBySku", result.getErrorsBySku());
+        return ResponseEntity.ok(body);
     }
 
     private String safe(String value) {
