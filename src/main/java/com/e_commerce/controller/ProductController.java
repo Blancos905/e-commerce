@@ -4,13 +4,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.e_commerce.dto.AppliedImportDTO;
 import com.e_commerce.dto.ProductUpdateRequest;
+import com.e_commerce.dto.ProductRevisionDTO;
 import com.e_commerce.model.Category;
 import com.e_commerce.model.Document;
 import com.e_commerce.model.Product;
 import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.DocumentRepository;
 import com.e_commerce.repository.ImportLogRepository;
-import com.e_commerce.dto.ProductRevisionDTO;
 import com.e_commerce.service.IcecatService;
 import com.e_commerce.service.ImportService;
 import com.e_commerce.service.MagentoService;
@@ -22,9 +22,18 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 @RestController
@@ -80,6 +89,12 @@ public class ProductController {
         return ResponseEntity.ok(java.util.Map.of("found", false, "matchType", "NOT_FOUND"));
     }
 
+    /** Numero totale di prodotti nel catalogo virtuale. */
+    @GetMapping("/count")
+    public ResponseEntity<Map<String, Long>> count() {
+        return ResponseEntity.ok(Map.of("count", productService.count()));
+    }
+
     @GetMapping
     public List<Product> list(@RequestParam(required = false) String nome,
                               @RequestParam(required = false) String sku,
@@ -94,6 +109,17 @@ public class ProductController {
 
     @PostMapping
     public Product create(@RequestBody Product product) {
+        // Prodotto creato manualmente: va nella categoria "Nuovi prodotti"
+        // tramite flag, ma mantiene la categoria "vera" scelta dall'utente.
+        product.setNuovoManuale(true);
+
+        // Assicuriamoci di associare una categoria "managed" (evita riferimenti detached con solo id).
+        if (product.getCategoria() != null && product.getCategoria().getId() != null) {
+            Long catId = product.getCategoria().getId();
+            Category cat = categoryRepository.findById(catId).orElse(null);
+            product.setCategoria(cat);
+        }
+
         return productService.save(product);
     }
 
@@ -148,9 +174,15 @@ public class ProductController {
     }
 
     @DeleteMapping("/reset")
+    @Transactional
     public ResponseEntity<Void> resetCatalog() {
-        // cancella tutti i prodotti (documenti collegati vengono rimossi per cascade/orphanRemoval)
-        productService.deleteAll();
+        // cancella i prodotti tranne quelli in "Nuovi prodotti" (documenti collegati vengono rimossi per cascade/orphanRemoval)
+        productService.deleteAllExceptCategoryName("Nuovi prodotti");
+
+        // Coerenza UI: dopo reset non devono esistere import "applicati" da annullare.
+        // Questi import alimentano `canRollbackLastImport` e la modale "Annulla import".
+        importLogRepository.clearAppliedProductImports();
+
         return ResponseEntity.noContent().build();
     }
 
@@ -264,6 +296,59 @@ public class ProductController {
         product.getDocumenti().add(doc);
         productService.save(product);
         return ResponseEntity.ok(doc);
+    }
+
+    /**
+     * Carica un'immagine dal PC locale e la associa al prodotto.
+     * Il file viene salvato nella stessa cartella usata da Icecat:
+     * storage/product-data/{productId}/images/...
+     */
+    @PostMapping(path = "/{id}/documents/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @Transactional
+    public ResponseEntity<?> uploadDocument(@PathVariable Long id, @RequestParam("file") MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.badRequest().body("Nessun file caricato.");
+        }
+        var productOpt = productService.findByIdWithAssociations(id);
+        if (productOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Product product = productOpt.get();
+        try {
+            String originalName = file.getOriginalFilename();
+            String ext = ".jpg";
+            if (originalName != null && originalName.contains(".")) {
+                String e = originalName.substring(originalName.lastIndexOf('.')).toLowerCase();
+                if (e.matches("\\.(jpeg|jpg|png|gif|webp)")) {
+                    ext = e;
+                }
+            }
+            String filename = "manual_" + System.currentTimeMillis() + ext;
+            Path productDir = Paths.get(icecatService.getStoragePathAbsolute(), String.valueOf(id), "images");
+            Files.createDirectories(productDir);
+            Path filePath = productDir.resolve(filename);
+            file.transferTo(filePath.toFile());
+
+            String relativeUrl = "/api/images/product/" + id + "/" + filename;
+
+            int maxOrdine = product.getDocumenti().stream()
+                    .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
+                    .max(Integer::compareTo)
+                    .orElse(-1);
+
+            Document doc = new Document();
+            doc.setTipo("immagine");
+            doc.setUrl(relativeUrl);
+            doc.setOrdine(maxOrdine + 1);
+            doc.setProduct(product);
+            documentRepository.save(doc);
+            product.getDocumenti().add(doc);
+            productService.save(product);
+
+            return ResponseEntity.ok(doc);
+        } catch (IOException e) {
+            return ResponseEntity.status(500).body("Errore nel salvataggio del file: " + e.getMessage());
+        }
     }
 
     /** Imposta un documento come immagine principale (ordine 0). Le altre immagini vengono riordinate. */
@@ -450,10 +535,117 @@ public class ProductController {
                     "error", result.getError()
             ));
         }
+
+        // Sync categorie per evitare che i PUT Magento appendano/lasciassero assegnazioni vecchie:
+        // rimuove dalle categorie gestite quelle non più corrette e assegna la categoria attuale.
+        var categoryResult = magentoService.syncCategoriesOnly(products);
+        if (categoryResult.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of(
+                    "error", categoryResult.getError()
+            ));
+        }
         var body = new java.util.HashMap<String, Object>();
         body.put("created", result.getCreated());
         body.put("updated", result.getUpdated());
         body.put("skipped", result.getSkipped());
+        body.put("imagesUploaded", result.getImagesUploaded());
+        body.put("errorsBySku", result.getErrorsBySku());
+        body.put("categoriesUpdated", categoryResult.getUpdated());
+        body.put("categoriesUnchanged", categoryResult.getUnchanged());
+        body.put("skippedNoSku", categoryResult.getSkippedNoSku());
+        body.put("skippedNotOnMagento", categoryResult.getSkippedNotOnMagento());
+        body.put("categoryErrorsBySku", categoryResult.getErrorsBySku());
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Sincronizza SOLO l'immagine principale dei prodotti già presenti su Magento.
+     * Non tocca prezzi, descrizioni, categorie: ricarica soltanto la primary image
+     * e la imposta come Base / Small / Thumbnail / Swatch.
+     */
+    @PostMapping("/export/magento/images")
+    public ResponseEntity<?> exportMagentoImagesOnly() {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.base-url, consumer-key, consumer-secret, access-token, access-token-secret in application.properties"
+                    ));
+        }
+        List<Product> products = productService.findAll();
+        var result = magentoService.syncImagesOnly(products);
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("error", result.getError()));
+        }
+        var body = new java.util.HashMap<String, Object>();
+        body.put("created", result.getCreated());
+        body.put("updated", result.getUpdated());
+        body.put("skipped", result.getSkipped());
+        body.put("imagesUploaded", result.getImagesUploaded());
+        body.put("errorsBySku", result.getErrorsBySku());
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Sincronizza SOLO l'immagine principale di un singolo prodotto (by ID).
+     * Utile per casi singoli quando manca l'immagine in lista Magento.
+     */
+    @PostMapping("/{id}/export/magento/image")
+    public ResponseEntity<?> exportSingleMagentoImage(@PathVariable Long id) {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.base-url, consumer-key, consumer-secret, access-token, access-token-secret in application.properties"
+                    ));
+        }
+        var opt = productService.findById(id);
+        if (opt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        var result = magentoService.syncImagesOnly(java.util.List.of(opt.get()));
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("error", result.getError()));
+        }
+        var body = new java.util.HashMap<String, Object>();
+        body.put("created", result.getCreated());
+        body.put("updated", result.getUpdated());
+        body.put("skipped", result.getSkipped());
+        body.put("imagesUploaded", result.getImagesUploaded());
+        body.put("errorsBySku", result.getErrorsBySku());
+        return ResponseEntity.ok(body);
+    }
+
+    /** Endpoint chiamato dal frontend quando l'utente preme "Annulla" durante una sync Magento. */
+    @PostMapping("/export/magento/cancel")
+    public ResponseEntity<?> cancelMagentoSync() {
+        magentoService.requestCancel();
+        return ResponseEntity.ok().build();
+    }
+
+    /**
+     * Allinea solo le categorie Magento alla categoria attuale nel catalogo virtuale
+     * (dopo spostamenti tra categorie). Non crea prodotti né aggiorna prezzi/descrizioni.
+     */
+    @PostMapping("/export/magento/categories")
+    public ResponseEntity<?> syncMagentoCategoriesFromCatalog() {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.* in application.properties"
+                    ));
+        }
+        List<Product> products = productService.findAll();
+        var result = magentoService.syncCategoriesOnly(products);
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("error", result.getError()));
+        }
+        var body = new java.util.HashMap<String, Object>();
+        body.put("updated", result.getUpdated());
+        body.put("unchanged", result.getUnchanged());
+        body.put("skippedNoSku", result.getSkippedNoSku());
+        body.put("skippedNotOnMagento", result.getSkippedNotOnMagento());
         body.put("errorsBySku", result.getErrorsBySku());
         return ResponseEntity.ok(body);
     }

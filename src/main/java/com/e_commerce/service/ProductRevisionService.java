@@ -70,6 +70,18 @@ public class ProductRevisionService {
                 .collect(Collectors.toList());
     }
 
+    /** Elimina tutte le revisioni (usato prima del reset completo del catalogo). */
+    @Transactional
+    public void deleteAllRevisions() {
+        revisionRepository.deleteAll();
+    }
+
+    /** Elimina le revisioni di un singolo prodotto (prima di eliminare il prodotto). */
+    @Transactional
+    public void deleteRevisionsByProductId(Long productId) {
+        revisionRepository.deleteByProductId(productId);
+    }
+
     /** Cronologia modifiche globale (tutti i prodotti, ordine data decrescente). */
     public List<ProductRevisionDTO> getAllRevisions() {
         List<ProductRevision> revisions = revisionRepository.findAllByOrderByCreatedAtDesc(

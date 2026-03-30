@@ -4,6 +4,7 @@ import com.e_commerce.dto.ImportLogSummaryDTO;
 import com.e_commerce.model.ImportLog;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
@@ -49,5 +50,13 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
             order by l.appliedAt desc
             """)
     List<com.e_commerce.dto.AppliedImportDTO> findAppliedImportsOrderByAppliedAtDesc();
+
+    /**
+     * Reset catalogo: per coerenza con l'utente, azzera lo "stato applicato" degli import PRODOTTI.
+     * In questo modo `canRollbackLastImport` e la lista `/products/applied-imports` diventano vuote.
+     */
+    @Modifying
+    @Query("update ImportLog l set l.appliedAt = null, l.previousStateJson = null where l.tipo = 'PRODOTTI' and l.appliedAt is not null")
+    int clearAppliedProductImports();
 }
 

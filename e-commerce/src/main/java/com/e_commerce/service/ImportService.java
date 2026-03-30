@@ -594,8 +594,8 @@ public class ImportService {
             return "Best sellers";
         }
 
-        // Videosorveglianza
-        if (containsAny(text, "videosorveglianza", "telecamera", "videocamera", "dvr", "nvr", "kit videosorveglianza")) {
+        // Videosorveglianza (include IPC = IP Camera / telecamere IP)
+        if (containsAny(text, "videosorveglianza", "telecamera", "videocamera", "dvr", "nvr", "kit videosorveglianza", "ipc", "ip camera", "ip-camera", "telecamera ip")) {
             return "Videosorveglianza";
         }
 

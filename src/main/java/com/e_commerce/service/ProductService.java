@@ -38,6 +38,10 @@ public class ProductService {
         this.productRevisionService = productRevisionService;
     }
 
+    public long count() {
+        return productRepository.count();
+    }
+
     public List<Product> findAll() {
         return productRepository.findAllWithAssociations();
     }
@@ -60,12 +64,41 @@ public class ProductService {
         String skuFilter = (sku != null && !sku.isBlank()) ? sku.trim() : null;
         String eanFilter = (ean != null && !ean.isBlank()) ? ean.trim() : null;
         String fornitoreFilter = (fornitore != null && !fornitore.isBlank()) ? fornitore.trim() : null;
+        String categoriaFilter = (categoria != null && !categoria.isBlank()) ? categoria.trim() : null;
+        String categoriaNorm = normalizeCategoryName(categoriaFilter);
+        final String nuoviProdottiCategoriaNorm = normalizeCategoryName("Nuovi prodotti");
+        final boolean isNuoviProdottiVirtual =
+                categoriaNorm != null
+                        && nuoviProdottiCategoriaNorm != null
+                        && nuoviProdottiCategoriaNorm.equalsIgnoreCase(categoriaNorm);
+
+        // Se il filtro categoria usa un nome che nel DB differisce anche solo per whitespace/unicode,
+        // è più robusto confrontare per ID categoria. Ricaviamo l'ID matching dal nome normalizzato.
+        final Long categoriaIdNorm = categoriaNorm == null
+                ? null
+                : categoryRepository.findAll().stream()
+                .filter(c -> c != null && c.getNome() != null)
+                .filter(c -> categoriaNorm.equalsIgnoreCase(normalizeCategoryName(c.getNome())))
+                .map(c -> c.getId())
+                .findFirst()
+                .orElse(null);
+
         return all.stream()
                 .filter(p -> nomeFilter == null || matchesSearchText(p.getNome(), nomeFilter))
                 .filter(p -> skuFilter == null || matchesSearchText(p.getSku(), skuFilter))
                 .filter(p -> eanFilter == null || matchesSearchText(p.getEan(), eanFilter))
-                .filter(p -> categoria == null || (p.getCategoria() != null &&
-                        categoria.equalsIgnoreCase(p.getCategoria().getNome())))
+                .filter(p -> categoriaFilter == null ||
+                        (isNuoviProdottiVirtual
+                                ? (Boolean.TRUE.equals(p.getNuovoManuale())
+                                || (p.getCategoria() != null
+                                && p.getCategoria().getNome() != null
+                                && nuoviProdottiCategoriaNorm != null
+                                && nuoviProdottiCategoriaNorm.equalsIgnoreCase(normalizeCategoryName(p.getCategoria().getNome()))))
+                                : (p.getCategoria() != null &&
+                                        p.getCategoria().getNome() != null &&
+                                        (categoriaIdNorm != null
+                                                ? categoriaIdNorm.equals(p.getCategoria().getId())
+                                                : categoriaNorm.equalsIgnoreCase(normalizeCategoryName(p.getCategoria().getNome()))))))
                 .filter(p -> fornitoreFilter == null || (p.getFornitore() != null &&
                         matchesSearchText(p.getFornitore().getNome(), fornitoreFilter)))
                 .collect(Collectors.toList());
@@ -116,6 +149,14 @@ public class ProductService {
         return lower.trim();
     }
 
+    private String normalizeCategoryName(String value) {
+        if (value == null) return null;
+        // Normalizza anche NBSP (U+00A0) e sequenze di spazi.
+        String v = value.replace('\u00A0', ' ').trim();
+        v = v.replaceAll("\\s+", " ");
+        return v;
+    }
+
     public Product save(Product product) {
         PriceSettings settings = priceSettingsRepository.findById(1L).orElse(null);
         if (product.getPrezzoBase() != null) {
@@ -154,11 +195,55 @@ public class ProductService {
     }
 
     public void deleteById(Long id) {
-        productRepository.deleteById(id);
+        productRevisionService.deleteRevisionsByProductId(id);
+        // Carichiamo le associazioni per garantire che i cascade (es. documenti) vengano applicati correttamente.
+        productRepository.findByIdWithAssociations(id).ifPresent(productRepository::delete);
     }
 
     public void deleteAll() {
+        productRevisionService.deleteAllRevisions();
         productRepository.deleteAll();
+    }
+
+    /**
+     * Reset catalogo "soft": cancella tutti i prodotti tranne quelli appartenenti alla categoria indicata.
+     * Serve per preservare i prodotti creati manualmente (es. "Nuovi prodotti").
+     */
+    public void deleteAllExceptCategoryName(String protectedCategoryName) {
+        if (protectedCategoryName == null || protectedCategoryName.isBlank()) {
+            deleteAll();
+            return;
+        }
+
+        var protectedCategory = categoryRepository.findByNomeIgnoreCase(protectedCategoryName.trim())
+                .orElse(null);
+        if (protectedCategory == null) {
+            deleteAll();
+            return;
+        }
+
+        boolean preserveNuoviProdottiManuali =
+                "Nuovi prodotti".equalsIgnoreCase(protectedCategoryName.trim());
+
+        Long protectedCategoryId = protectedCategory.getId();
+        // Usiamo findAll() base (senza associazioni pesanti) perché poi cancelliamo per id.
+        List<Product> allProducts = productRepository.findAll();
+        for (Product p : allProducts) {
+            if (preserveNuoviProdottiManuali) {
+                boolean isManualNew =
+                        Boolean.TRUE.equals(p.getNuovoManuale())
+                                || (p.getCategoria() != null
+                                && p.getCategoria().getNome() != null
+                                && "Nuovi prodotti".equalsIgnoreCase(p.getCategoria().getNome()));
+                if (isManualNew) continue; // preserviamo i prodotti manuali
+            } else {
+                Long catId = p.getCategoria() != null ? p.getCategoria().getId() : null;
+                if (protectedCategoryId.equals(catId)) {
+                    continue; // preserviamo
+                }
+            }
+            deleteById(p.getId());
+        }
     }
 
     /**

@@ -43,4 +43,8 @@ public class ProductImportDTO {
     /** CS = disponibilità (quella che ci interessa) */
     @CsvBindByName(column = "disponibilita")
     private String disponibilita;
+
+    /** Descrizione prodotto (testo lungo); colonne "descrizione", "description" mappate qui. */
+    @CsvBindByName(column = "descrizione")
+    private String descrizione;
 }

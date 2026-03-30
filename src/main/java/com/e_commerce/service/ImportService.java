@@ -30,6 +30,7 @@ import org.apache.poi.ss.usermodel.WorkbookFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.ByteArrayInputStream;
@@ -42,6 +43,10 @@ import java.util.HashMap;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -70,6 +75,16 @@ public class ImportService {
     private final ProductMatchingService productMatchingService;
     private final IcecatService icecatService;
 
+    /** Flag per annullare in modo cooperativo gli import lunghi. */
+    private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
+
+    /**
+     * Esegue in background la sync Icecat dopo l'applicazione import, per evitare che la richiesta HTTP resti appesa.
+     * Disattivabile via property `import.icecat.sync-after-apply=false`.
+     */
+    @org.springframework.beans.factory.annotation.Value("${import.icecat.sync-after-apply:true}")
+    private boolean syncIcecatAfterApply;
+
     public ImportService(ProductRepository productRepository,
                          CategoryRepository categoryRepository,
                          DocumentRepository documentRepository,
@@ -88,7 +103,23 @@ public class ImportService {
         this.icecatService = icecatService;
     }
 
+    /** Chiamato quando l'utente preme "Annulla" dal frontend. */
+    public void requestCancel() {
+        cancelRequested.set(true);
+    }
+
+    private void resetCancel() {
+        cancelRequested.set(false);
+    }
+
+    private void checkCancelled() {
+        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("Operazione di import annullata dall'utente.");
+        }
+    }
+
     public void importProducts(MultipartFile file, Long supplierId) throws Exception {
+        resetCancel();
         importProductsFromBytes(
                 file.getBytes(),
                 file.getOriginalFilename(),
@@ -103,6 +134,7 @@ public class ImportService {
             throw new IllegalArgumentException("File CSV non disponibile nello storico import.");
         }
         Long supplierId = log.getSupplier() != null ? log.getSupplier().getId() : null;
+        resetCancel();
         importProductsFromBytes(
                 log.getFileContent(),
                 log.getFileName(),
@@ -115,7 +147,9 @@ public class ImportService {
     /**
      * Applica l'import al catalogo salvando uno snapshot dello stato precedente.
      * Permette il rollback senza resettare tutto il catalogo.
+     * Transazione nel servizio per evitare "rollback-only" quando il controller cattura eccezioni.
      */
+    @Transactional(noRollbackFor = CancellationException.class)
     public void applyImportWithSnapshot(ImportLog log) throws Exception {
         if (log == null || log.getFileContent() == null || log.getFileContent().length == 0) {
             throw new IllegalArgumentException("File non disponibile nello storico import.");
@@ -123,6 +157,7 @@ public class ImportService {
         if (log.getSupplier() == null) {
             throw new IllegalArgumentException("Import senza fornitore associato.");
         }
+        resetCancel();
         List<ProductImportDTO> rows = parseProductRowsFromBytes(
                 log.getFileContent(),
                 log.getFileName(),
@@ -130,32 +165,49 @@ public class ImportService {
         );
         Map<String, ProductSnapshotDTO> snapshot = new HashMap<>();
         for (ProductImportDTO dto : rows) {
+            checkCancelled();
             String sku = normalize(dto.getSku());
             if (sku == null) continue;
             String skuTruncated = truncate(sku, 255);
             productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> snapshot.put(skuTruncated, toSnapshot(p)));
         }
-        processProductRows(rows, log.getSupplier());
+        processProductRows(rows, log.getSupplier(), log.getFileName());
         ObjectMapper mapper = new ObjectMapper();
         log.setPreviousStateJson(mapper.writeValueAsString(snapshot));
         log.setAppliedAt(LocalDateTime.now());
         importLogRepository.save(log);
 
-        // Sincronizza automaticamente le immagini Icecat per i prodotti appena importati
-        for (ProductImportDTO dto : rows) {
-            String sku = normalize(dto.getSku());
-            if (sku == null) continue;
-            String skuTruncated = truncate(sku, 255);
-            productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
+        // Sincronizza automaticamente le immagini Icecat per i prodotti appena importati.
+        // IMPORTANTE: lo facciamo in background per non bloccare la risposta HTTP quando il file ha molte righe.
+        if (syncIcecatAfterApply) {
+            CompletableFuture.runAsync(() -> {
                 try {
-                    int added = icecatService.syncImagesForProduct(p.getId());
-                    if (added > 0) {
-                        ImportService.log.info("Import catalogo: Icecat ha aggiunto {} immagini per prodotto {} (SKU: {})", added, p.getId(), skuTruncated);
+                    for (ProductImportDTO dto : rows) {
+                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+                            throw new CancellationException("Sync Icecat annullata dall'utente.");
+                        }
+                        String sku = normalize(dto.getSku());
+                        if (sku == null) continue;
+                        String skuTruncated = truncate(sku, 255);
+                        productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
+                            try {
+                                int added = icecatService.syncImagesForProduct(p.getId());
+                                if (added > 0) {
+                                    ImportService.log.info("Import catalogo: Icecat ha aggiunto {} immagini per prodotto {} (SKU: {})", added, p.getId(), skuTruncated);
+                                }
+                            } catch (Exception e) {
+                                ImportService.log.warn("Import catalogo: sync Icecat fallito per prodotto {} (SKU: {}): {}", p.getId(), skuTruncated, e.getMessage());
+                            }
+                        });
                     }
+                } catch (CancellationException ce) {
+                    ImportService.log.info("Import catalogo: sync Icecat interrotta: {}", ce.getMessage());
                 } catch (Exception e) {
-                    ImportService.log.warn("Import catalogo: sync Icecat fallito per prodotto {} (SKU: {}): {}", p.getId(), skuTruncated, e.getMessage());
+                    ImportService.log.warn("Import catalogo: sync Icecat background fallita: {}", e.getMessage());
                 }
             });
+        } else {
+            ImportService.log.info("Import catalogo: sync Icecat post-apply disattivata (import.icecat.sync-after-apply=false)");
         }
     }
 
@@ -167,6 +219,10 @@ public class ImportService {
         if (log == null || log.getPreviousStateJson() == null || log.getPreviousStateJson().isBlank()) {
             throw new IllegalArgumentException("Impossibile fare rollback: nessuno snapshot disponibile per questo import.");
         }
+        resetCancel();
+
+        // I prodotti manuali creati dall'utente devono essere preservati anche in rollback.
+        // Usiamo il flag invece della categoria, perché la categoria "vera" deve rimanere quella scelta.
         List<ProductImportDTO> rows = parseProductRowsFromBytes(
                 log.getFileContent(),
                 log.getFileName(),
@@ -178,6 +234,7 @@ public class ImportService {
                 new TypeReference<Map<String, ProductSnapshotDTO>>() {}
         );
         for (ProductImportDTO dto : rows) {
+            checkCancelled();
             String sku = normalize(dto.getSku());
             if (sku == null) continue;
             String skuTruncated = truncate(sku, 255);
@@ -185,7 +242,17 @@ public class ImportService {
             if (snap != null) {
                 restoreFromSnapshot(snap);
             } else {
-                productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> productService.deleteById(p.getId()));
+                productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
+                    // Nessuno snapshot: significa prodotto creato dall'import nel "catalogo virtuale".
+                    // Però se l'utente ha creato manualmente lo stesso SKU, lo preserviamo.
+                    boolean isManualNew =
+                            Boolean.TRUE.equals(p.getNuovoManuale())
+                                    || (p.getCategoria() != null
+                                    && p.getCategoria().getNome() != null
+                                    && "Nuovi prodotti".equalsIgnoreCase(p.getCategoria().getNome()));
+                    if (isManualNew) return;
+                    productService.deleteById(p.getId());
+                });
             }
         }
         // Non eliminare l'ImportLog: il file resta nella cartella fornitori. Solo annulliamo lo stato "applicato".
@@ -245,29 +312,62 @@ public class ImportService {
         return parseCsvBytes(bytes, ProductImportDTO.class, "Prodotti (CSV): header atteso almeno: sku,nome_prodotto,categoria.");
     }
 
-    private void processProductRows(List<ProductImportDTO> rows, Supplier supplier) throws Exception {
+    /**
+     * Se il nome del file (senza estensione) coincide con una categoria esistente (match ignorando maiuscole/minuscole),
+     * quella categoria viene usata per TUTTI i prodotti dell'import.
+     *
+     * Eccezione/alias: la categoria seed è `Best sellers` (plurale), quindi accetta anche file `best seller`.
+     * Se nessuna categoria corrisponde, ritorna empty e si usa la categoria per riga (colonna/mapping).
+     */
+    private Optional<Category> resolveCategoryFromFilename(String filename) {
+        if (filename == null || filename.isBlank()) return Optional.empty();
+        int lastDot = filename.lastIndexOf('.');
+        String baseName = lastDot > 0 ? filename.substring(0, lastDot).trim() : filename.trim();
+        if (baseName.isEmpty()) return Optional.empty();
+
+        // Normalizza per alias "best seller" -> "Best sellers"
+        String normalized = baseName
+                .toLowerCase()
+                .replaceAll("[^a-z0-9]+", " ")
+                .trim();
+        // startsWith per gestire nomi tipo "best seller_2024.csv" o "Best sellers - gennaio.xlsx"
+        String canonicalName = normalized.startsWith("best seller") ? "Best sellers" : baseName;
+
+        // Prima match esatto, poi ignore case
+        return categoryRepository.findByNome(canonicalName)
+                .or(() -> categoryRepository.findByNomeIgnoreCase(canonicalName));
+    }
+
+    private void processProductRows(List<ProductImportDTO> rows, Supplier supplier, String filename) throws Exception {
+        Optional<Category> categoryFromFilename = resolveCategoryFromFilename(filename);
         for (ProductImportDTO dto : rows) {
+            checkCancelled();
             String sku = normalize(dto.getSku());
             if (sku == null) continue;
             sku = truncate(sku, 255);
             String nomeProdotto = normalize(dto.getNome());
             if (nomeProdotto == null) nomeProdotto = sku;
             nomeProdotto = truncate(nomeProdotto, 255);
-            String rawNomeCategoria = normalize(dto.getNomeCategoria());
-            String nomeCategoria;
-            if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
-                    && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
-                nomeCategoria = rawNomeCategoria;
+            Category category;
+            if (categoryFromFilename.isPresent()) {
+                category = categoryFromFilename.get();
             } else {
-                String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
-                nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+                String rawNomeCategoria = normalize(dto.getNomeCategoria());
+                String nomeCategoria;
+                if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
+                        && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
+                    nomeCategoria = rawNomeCategoria;
+                } else {
+                    String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
+                    nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+                }
+                category = categoryRepository.findByNome(nomeCategoria)
+                        .orElseGet(() -> {
+                            Category c = new Category();
+                            c.setNome(nomeCategoria);
+                            return categoryRepository.save(c);
+                        });
             }
-            Category category = categoryRepository.findByNome(nomeCategoria)
-                    .orElseGet(() -> {
-                        Category c = new Category();
-                        c.setNome(nomeCategoria);
-                        return categoryRepository.save(c);
-                    });
             Product product = productMatchingService.findProductBySkuOnly(sku).getProduct().orElseGet(Product::new);
             product.setSku(sku);
             product.setNome(nomeProdotto);
@@ -279,6 +379,8 @@ public class ImportService {
             product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
             product.setMarca(truncate(normalize(dto.getMarca()), 128));
             product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
+            String descrizioneVal = normalize(dto.getDescrizione());
+            product.setDescrizione(descrizioneVal != null && !descrizioneVal.isBlank() ? descrizioneVal : null);
             productService.save(product);
         }
     }
@@ -288,6 +390,7 @@ public class ImportService {
                                         String contentType,
                                         Long supplierId,
                                         boolean createImportLog) throws Exception {
+        resetCancel();
         List<ProductImportDTO> rows;
         if (isExcelFile(originalFilename, contentType)) {
             rows = parseProductsXlsxOrXlsBytes(bytes, "Prodotti (Excel .xlsx/.xls): header atteso almeno: sku,nome_prodotto,categoria,prezzo.");
@@ -303,8 +406,22 @@ public class ImportService {
                     .orElseThrow(() -> new IllegalArgumentException("Fornitore non trovato (supplierId=" + supplierId + ")."));
         }
 
+        int totalRowsHint = rows != null ? rows.size() : 0;
+        log.info("Import prodotti avviato: file='{}', supplierId={}, righe={}",
+                originalFilename != null ? originalFilename : "sconosciuto",
+                supplierId,
+                totalRowsHint);
+
+        // Se il nome del file (senza estensione) coincide con una categoria, tutti i prodotti vanno in quella categoria
+        Optional<Category> categoryFromFilename = resolveCategoryFromFilename(originalFilename);
+        if (categoryFromFilename.isPresent()) {
+            log.info("Import prodotti: categoria forzata dal nome file '{}' -> tutti i prodotti in categoria '{}'",
+                    originalFilename, categoryFromFilename.get().getNome());
+        }
+
         int rowNumber = 1; // 1-based rispetto alle righe dati (escluso header)
         for (ProductImportDTO dto : rows) {
+            checkCancelled();
             String codiceRaw = normalize(dto.getSku());
             if (codiceRaw == null) {
                 codiceRaw = normalize(dto.getEan());
@@ -338,23 +455,27 @@ public class ImportService {
             }
             nomeProdotto = truncate(nomeProdotto, 255);
 
-            String rawNomeCategoria = normalize(dto.getNomeCategoria());
-            String nomeCategoria;
-            if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
-                    && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
-                nomeCategoria = rawNomeCategoria;
+            Category category;
+            if (categoryFromFilename.isPresent()) {
+                category = categoryFromFilename.get();
             } else {
-                String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
-                nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+                String rawNomeCategoria = normalize(dto.getNomeCategoria());
+                String nomeCategoria;
+                if (rawNomeCategoria != null && !rawNomeCategoria.isBlank()
+                        && categoryRepository.findByNome(rawNomeCategoria).isPresent()) {
+                    nomeCategoria = rawNomeCategoria;
+                } else {
+                    String mappedCategoria = mapToMainCategory(rawNomeCategoria, nomeProdotto);
+                    nomeCategoria = mappedCategoria != null ? mappedCategoria : "Accessori";
+                }
+                category = categoryRepository
+                        .findByNome(nomeCategoria)
+                        .orElseGet(() -> {
+                            Category c = new Category();
+                            c.setNome(nomeCategoria);
+                            return categoryRepository.save(c);
+                        });
             }
-
-            Category category = categoryRepository
-                    .findByNome(nomeCategoria)
-                    .orElseGet(() -> {
-                        Category c = new Category();
-                        c.setNome(nomeCategoria);
-                        return categoryRepository.save(c);
-                    });
 
             // Match: se codice era EAN, cerca per EAN; altrimenti per SKU
             Product product = (isCodiceEan
@@ -381,9 +502,19 @@ public class ImportService {
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
             product.setMarca(truncate(normalize(dto.getMarca()), 128));
             product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
+            String descrizioneVal = normalize(dto.getDescrizione());
+            product.setDescrizione(descrizioneVal != null && !descrizioneVal.isBlank() ? descrizioneVal : null);
 
             productService.save(product);
             rowNumber++;
+
+            // Progress log ogni 200 righe (evita silenzio su import lunghi)
+            if ((rowNumber - 1) % 200 == 0) {
+                log.info("Import prodotti: progresso {}/{} (file='{}')",
+                        (rowNumber - 1),
+                        totalRowsHint,
+                        originalFilename != null ? originalFilename : "sconosciuto");
+            }
         }
 
         // Log dell'import prodotti per fornitore (se specificato)
@@ -397,6 +528,11 @@ public class ImportService {
             log.setImportedAt(LocalDateTime.now());
             importLogRepository.save(log);
         }
+
+        log.info("Import prodotti completato: file='{}', salvati={} righe, supplierId={}",
+                originalFilename != null ? originalFilename : "sconosciuto",
+                (rowNumber - 1),
+                supplierId);
     }
 
     public void importDocuments(MultipartFile file, Long supplierId) throws Exception {
@@ -671,9 +807,12 @@ public class ImportService {
 
             // prodotti - nome
             case "nome" -> "nome_prodotto";
-            case "nomeprodotto", "nome_del_prodotto", "prodotto", "articolo", "descrizione",
-                    "desc", "titolo", "title", "denominazione" -> "nome_prodotto";
-            case "name", "product_name", "productname", "product", "description", "item_name" -> "nome_prodotto";
+            case "nomeprodotto", "nome_del_prodotto", "prodotto", "articolo",
+                    "titolo", "title", "denominazione" -> "nome_prodotto";
+            case "name", "product_name", "productname", "product", "item_name" -> "nome_prodotto";
+
+            // prodotti - descrizione (testo lungo; non confondere con nome)
+            case "descrizione", "description", "long_description", "desc", "product_description", "testo" -> "descrizione";
 
             // prodotti - prezzo (CON/contanti/contati = prezzo in contanti dal fornitore -> prezzo base)
             case "prezzo_base", "prezzo_listino", "prezzobase", "prezzo_di_listino",
@@ -839,6 +978,7 @@ public class ImportService {
                 Integer eanIdx = headerToIndex.get("ean");
                 Integer marcaIdx = headerToIndex.get("marca");
                 Integer codiceProduttoreIdx = headerToIndex.get("codice_produttore");
+                Integer descrizioneIdx = headerToIndex.get("descrizione");
                 int firstDataRow = headerRow.getRowNum() + (usedSubHeader ? 2 : 1);
                 // Controllo esplicito colonna 33 (formato con molte colonne: Category,Brand,Codice,...,CS,PZ)
                 if (headerRow.getLastCellNum() > COLONNA_CS_ALTERNATIVA) {
@@ -916,6 +1056,7 @@ public class ImportService {
                     String ean = eanIdx != null ? readCellAsString(row, eanIdx, formatter) : null;
                     String marca = marcaIdx != null ? readCellAsString(row, marcaIdx, formatter) : null;
                     String codiceProduttore = codiceProduttoreIdx != null ? readCellAsString(row, codiceProduttoreIdx, formatter) : null;
+                    String descrizione = descrizioneIdx != null ? readCellAsString(row, descrizioneIdx, formatter) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
@@ -926,6 +1067,7 @@ public class ImportService {
                     dto.setDisponibilita(disponibilita);
                     dto.setMarca(marca);
                     dto.setCodiceProduttore(codiceProduttore);
+                    dto.setDescrizione(descrizione);
                     rows.add(dto);
                 }
                 return rows;
@@ -1052,6 +1194,7 @@ public class ImportService {
                     Integer eanIdx = headerToIndex.get("ean");
                     Integer marcaIdx = headerToIndex.get("marca");
                     Integer codiceProduttoreIdx = headerToIndex.get("codice_produttore");
+                    Integer descrizioneIdx = headerToIndex.get("descrizione");
 
                     String sku = skuIdx != null && cellValues.size() > skuIdx ? normalize(cellValues.get(skuIdx)) : null;
                     String categoria = catIdx != null && cellValues.size() > catIdx ? normalize(cellValues.get(catIdx)) : null;
@@ -1066,6 +1209,7 @@ public class ImportService {
                     String ean = eanIdx != null && cellValues.size() > eanIdx ? normalize(cellValues.get(eanIdx)) : null;
                     String marca = marcaIdx != null && cellValues.size() > marcaIdx ? normalize(cellValues.get(marcaIdx)) : null;
                     String codiceProduttore = codiceProduttoreIdx != null && cellValues.size() > codiceProduttoreIdx ? normalize(cellValues.get(codiceProduttoreIdx)) : null;
+                    String descrizione = descrizioneIdx != null && cellValues.size() > descrizioneIdx ? normalize(cellValues.get(descrizioneIdx)) : null;
 
                     ProductImportDTO dto = new ProductImportDTO();
                     dto.setSku(sku);
@@ -1076,6 +1220,7 @@ public class ImportService {
                     dto.setNomeCategoria(categoria);
                     dto.setPrezzoBase(prezzo);
                     dto.setDisponibilita(disponibilita);
+                    dto.setDescrizione(descrizione);
                     result.add(dto);
                 }
             }
@@ -1257,8 +1402,8 @@ public class ImportService {
             return "Best sellers";
         }
 
-        // Videosorveglianza
-        if (containsAny(text, "videosorveglianza", "telecamera", "videocamera", "dvr", "nvr", "kit videosorveglianza")) {
+        // Videosorveglianza (include IPC = IP Camera / telecamere IP)
+        if (containsAny(text, "videosorveglianza", "telecamera", "videocamera", "dvr", "nvr", "kit videosorveglianza", "ipc", "ip camera", "ip-camera", "telecamera ip")) {
             return "Videosorveglianza";
         }
 

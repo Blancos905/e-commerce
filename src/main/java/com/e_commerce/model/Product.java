@@ -55,6 +55,13 @@ public class Product {
     @JoinColumn(name = "supplier_id")
     private Supplier fornitore;
 
+    /**
+     * Flag usato dalla UI per la sezione "Nuovi prodotti".
+     * Serve perché un prodotto può avere una sola categoria "vera".
+     */
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private Boolean nuovoManuale = false;
+
     /** CON = contati (stock contato dal fornitore) */
     @Column(length = 64)
     private String contati;

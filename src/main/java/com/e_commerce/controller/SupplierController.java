@@ -15,6 +15,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 
 @RestController
 @RequestMapping("/api/suppliers")
@@ -94,7 +95,6 @@ public class SupplierController {
     }
 
     @PostMapping("/{id}/imports/{importId}/apply-products")
-    @Transactional
     public ResponseEntity<?> applyImportToCatalog(@PathVariable Long id, @PathVariable Long importId) {
         if (supplierService.findById(id).isEmpty()) {
             return ResponseEntity.notFound().build();
@@ -109,6 +109,10 @@ public class SupplierController {
         try {
             importService.applyImportWithSnapshot(log);
             return ResponseEntity.ok().build();
+        } catch (CancellationException e) {
+            // Import interrotto dall'utente: mantieni i prodotti già applicati (no rollback)
+            return ResponseEntity.status(499)
+                    .body("Import nel catalogo annullato dall'utente. I prodotti già applicati sono stati salvati.");
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         } catch (Exception e) {

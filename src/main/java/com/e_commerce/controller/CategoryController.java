@@ -61,6 +61,8 @@ public class CategoryController {
                 "Accessori",
                 "Scuola e Laboratori",
                 "Best sellers",
+                "Nuovi prodotti",
+                "In offerta",
                 "Videosorveglianza"
         );
 

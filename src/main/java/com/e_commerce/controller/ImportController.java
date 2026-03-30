@@ -8,6 +8,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.util.concurrent.CancellationException;
+
 @RestController
 @RequestMapping("/api/import")
 public class ImportController {
@@ -24,6 +26,9 @@ public class ImportController {
         try {
             importService.importProducts(file, supplierId);
             return ResponseEntity.ok().build();
+        } catch (CancellationException e) {
+            return ResponseEntity.status(499)
+                    .body("Import prodotti annullato dall'utente.");
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         } catch (Exception e) {
@@ -38,6 +43,9 @@ public class ImportController {
         try {
             importService.importDocuments(file, supplierId);
             return ResponseEntity.ok().build();
+        } catch (CancellationException e) {
+            return ResponseEntity.status(499)
+                    .body("Import documenti annullato dall'utente.");
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         } catch (Exception e) {
@@ -51,12 +59,26 @@ public class ImportController {
         try {
             importService.importSuppliers(file);
             return ResponseEntity.ok().build();
+        } catch (CancellationException e) {
+            return ResponseEntity.status(499)
+                    .body("Import fornitori annullato dall'utente.");
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(e.getMessage());
         } catch (Exception e) {
             return ResponseEntity.internalServerError()
                     .body("Errore durante l'import fornitori: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
         }
+    }
+
+    /**
+     * Endpoint chiamato dal frontend quando l'utente preme il bottone "Annulla".
+     * Non interrompe brutalmente la richiesta HTTP, ma segnala ai metodi di import
+     * di fermarsi alla prima iterazione utile.
+     */
+    @PostMapping("/cancel")
+    public ResponseEntity<?> cancelCurrentImport() {
+        importService.requestCancel();
+        return ResponseEntity.ok().build();
     }
 }
 

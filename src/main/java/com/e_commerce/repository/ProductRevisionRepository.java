@@ -11,4 +11,6 @@ public interface ProductRevisionRepository extends JpaRepository<ProductRevision
     List<ProductRevision> findByProductIdOrderByCreatedAtDesc(Long productId, Pageable pageable);
 
     List<ProductRevision> findAllByOrderByCreatedAtDesc(Pageable pageable);
+
+    void deleteByProductId(Long productId);
 }
