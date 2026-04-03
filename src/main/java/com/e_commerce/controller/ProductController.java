@@ -169,14 +169,31 @@ public class ProductController {
         if (productService.findById(id).isEmpty()) {
             return ResponseEntity.notFound().build();
         }
-        productService.deleteById(id);
+        productService.softDeleteById(id);
         return ResponseEntity.noContent().build();
+    }
+
+    /** Rimuove il prodotto solo dalla vista virtuale "In offerta". */
+    @PostMapping("/{id}/remove-offerta")
+    public ResponseEntity<Product> removeFromOfferta(@PathVariable Long id) {
+        return productService.removeFromOfferta(id)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** Rimuove il prodotto solo dalla vista virtuale "Nuovi prodotti". */
+    @PostMapping("/{id}/remove-nuovi-prodotti")
+    public ResponseEntity<Product> removeFromNuoviProdotti(@PathVariable Long id) {
+        return productService.removeFromNuoviProdotti(id)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @DeleteMapping("/reset")
     @Transactional
     public ResponseEntity<Void> resetCatalog() {
         // cancella i prodotti tranne quelli in "Nuovi prodotti" (documenti collegati vengono rimossi per cascade/orphanRemoval)
+        // I prodotti modificati manualmente (immagini/descrizione) vengono ora soft-deleted e quindi recuperabili.
         productService.deleteAllExceptCategoryName("Nuovi prodotti");
 
         // Coerenza UI: dopo reset non devono esistere import "applicati" da annullare.
@@ -184,6 +201,27 @@ public class ProductController {
         importLogRepository.clearAppliedProductImports();
 
         return ResponseEntity.noContent().build();
+    }
+
+    /** Elenco prodotti soft-deleted (recuperabili). */
+    @GetMapping("/deleted")
+    public ResponseEntity<List<Product>> listDeletedProducts() {
+        return ResponseEntity.ok(productService.findSoftDeleted());
+    }
+
+    /** Ripristina un prodotto soft-deleted. */
+    @PostMapping("/{id}/restore")
+    public ResponseEntity<Product> restoreDeletedProduct(@PathVariable Long id) {
+        return productService.restoreSoftDeleted(id)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /** Svuota il cestino: elimina definitivamente tutti i prodotti soft-deleted. */
+    @DeleteMapping("/deleted/empty")
+    public ResponseEntity<Map<String, Integer>> emptyTrash() {
+        int deleted = productService.emptyTrash();
+        return ResponseEntity.ok(Map.of("deleted", deleted));
     }
 
     @PostMapping("/{id}/sync-icecat-images")
@@ -270,7 +308,8 @@ public class ProductController {
     @Transactional
     public ResponseEntity<?> addDocument(@PathVariable Long id, @RequestBody java.util.Map<String, String> body) {
         String url = body != null ? body.get("url") : null;
-        String tipo = body != null && body.get("tipo") != null ? body.get("tipo").trim() : "immagine";
+        String tipo = body != null && body.get("tipo") != null ? body.get("tipo").trim() : "immagine_manual";
+        String descrizione = body != null ? body.get("descrizione") : null;
         if (url == null || url.isBlank()) {
             return ResponseEntity.badRequest().body("Campo 'url' obbligatorio.");
         }
@@ -283,6 +322,13 @@ public class ProductController {
             return ResponseEntity.notFound().build();
         }
         Product product = productOpt.get();
+
+        // Endpoint "documenti" è usato dalla UI come associazione manuale:
+        // se non è specificato, o se viene passato "immagine", lo trattiamo come immagine manuale.
+        if (tipo == null || tipo.isBlank() || "immagine".equalsIgnoreCase(tipo)) {
+            tipo = "immagine_manual";
+        }
+
         int maxOrdine = product.getDocumenti().stream()
                 .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
                 .max(Integer::compareTo)
@@ -294,6 +340,9 @@ public class ProductController {
         doc.setProduct(product);
         documentRepository.save(doc);
         product.getDocumenti().add(doc);
+        if (descrizione != null && !descrizione.trim().isEmpty()) {
+            product.setDescrizione(descrizione.trim());
+        }
         productService.save(product);
         return ResponseEntity.ok(doc);
     }
@@ -305,7 +354,9 @@ public class ProductController {
      */
     @PostMapping(path = "/{id}/documents/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @Transactional
-    public ResponseEntity<?> uploadDocument(@PathVariable Long id, @RequestParam("file") MultipartFile file) {
+    public ResponseEntity<?> uploadDocument(@PathVariable Long id,
+                                            @RequestParam("file") MultipartFile file,
+                                            @RequestParam(value = "descrizione", required = false) String descrizione) {
         if (file == null || file.isEmpty()) {
             return ResponseEntity.badRequest().body("Nessun file caricato.");
         }
@@ -337,12 +388,15 @@ public class ProductController {
                     .orElse(-1);
 
             Document doc = new Document();
-            doc.setTipo("immagine");
+            doc.setTipo("immagine_manual");
             doc.setUrl(relativeUrl);
             doc.setOrdine(maxOrdine + 1);
             doc.setProduct(product);
             documentRepository.save(doc);
             product.getDocumenti().add(doc);
+            if (descrizione != null && !descrizione.trim().isEmpty()) {
+                product.setDescrizione(descrizione.trim());
+            }
             productService.save(product);
 
             return ResponseEntity.ok(doc);
@@ -616,6 +670,38 @@ public class ProductController {
         return ResponseEntity.ok(body);
     }
 
+    /**
+     * Sincronizza un singolo prodotto su Magento (dati + immagine principale).
+     * Utile dopo modifiche manuali su disponibilità, descrizione, prezzo o immagine.
+     */
+    @PostMapping("/{id}/export/magento")
+    public ResponseEntity<?> exportSingleProductToMagento(@PathVariable Long id) {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.base-url, consumer-key, consumer-secret, access-token, access-token-secret in application.properties"
+                    ));
+        }
+        var opt = productService.findById(id);
+        if (opt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+
+        var result = magentoService.syncCatalog(java.util.List.of(opt.get()));
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("error", result.getError()));
+        }
+
+        var body = new java.util.HashMap<String, Object>();
+        body.put("created", result.getCreated());
+        body.put("updated", result.getUpdated());
+        body.put("skipped", result.getSkipped());
+        body.put("imagesUploaded", result.getImagesUploaded());
+        body.put("errorsBySku", result.getErrorsBySku());
+        return ResponseEntity.ok(body);
+    }
+
     /** Endpoint chiamato dal frontend quando l'utente preme "Annulla" durante una sync Magento. */
     @PostMapping("/export/magento/cancel")
     public ResponseEntity<?> cancelMagentoSync() {
@@ -646,6 +732,45 @@ public class ProductController {
         body.put("unchanged", result.getUnchanged());
         body.put("skippedNoSku", result.getSkippedNoSku());
         body.put("skippedNotOnMagento", result.getSkippedNotOnMagento());
+        body.put("errorsBySku", result.getErrorsBySku());
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Sincronizza su Magento tutti i prodotti di una singola categoria del catalogo virtuale.
+     * Per ogni SKU: se esiste aggiorna, altrimenti crea.
+     */
+    @PostMapping("/export/magento/category/{categoryId}")
+    public ResponseEntity<?> exportCategoryToMagento(@PathVariable Long categoryId) {
+        if (!magentoService.isConfigured()) {
+            return ResponseEntity.badRequest()
+                    .body(java.util.Map.of(
+                            "error", "Magento non configurato",
+                            "hint", "Configura magento.* in application.properties"
+                    ));
+        }
+        Category category = categoryRepository.findById(categoryId).orElse(null);
+        if (category == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        List<Product> products = productService.findAll().stream()
+                .filter(p -> p.getCategoria() != null && categoryId.equals(p.getCategoria().getId()))
+                .collect(Collectors.toList());
+
+        var result = magentoService.syncCatalog(products);
+        if (result.getError() != null) {
+            return ResponseEntity.badRequest().body(java.util.Map.of("error", result.getError()));
+        }
+
+        var body = new java.util.HashMap<String, Object>();
+        body.put("categoryId", categoryId);
+        body.put("categoryName", category.getNome());
+        body.put("productsProcessed", products.size());
+        body.put("created", result.getCreated());
+        body.put("updated", result.getUpdated());
+        body.put("skipped", result.getSkipped());
+        body.put("imagesUploaded", result.getImagesUploaded());
         body.put("errorsBySku", result.getErrorsBySku());
         return ResponseEntity.ok(body);
     }

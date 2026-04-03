@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/categories")
@@ -30,6 +31,28 @@ public class CategoryController {
     @GetMapping
     public List<Category> list() {
         return categoryService.findAll();
+    }
+
+    @GetMapping("/counts")
+    public ResponseEntity<Map<Long, Long>> counts() {
+        List<Category> all = categoryService.findAll();
+        Map<Long, Long> out = new java.util.HashMap<>();
+        String offerta = normalizeCategoryName("In offerta");
+        String nuovi = normalizeCategoryName("Nuovi prodotti");
+        for (Category c : all) {
+            if (c == null || c.getId() == null) continue;
+            String name = normalizeCategoryName(c.getNome());
+            long count;
+            if (offerta.equalsIgnoreCase(name)) {
+                count = productRepository.countActiveInOffertaTrue();
+            } else if (nuovi.equalsIgnoreCase(name)) {
+                count = productRepository.countActiveNuovoManualeTrue();
+            } else {
+                count = productRepository.countActiveByCategoriaId(c.getId());
+            }
+            out.put(c.getId(), count);
+        }
+        return ResponseEntity.ok(out);
     }
 
     @PostMapping
@@ -101,6 +124,11 @@ public class CategoryController {
                 });
     }
 
+    private String normalizeCategoryName(String value) {
+        if (value == null) return "";
+        return value.replace('\u00A0', ' ').trim().replaceAll("\\s+", " ");
+    }
+
     @PutMapping("/{id}")
     public ResponseEntity<Category> update(@PathVariable Long id, @RequestBody Category updated) {
         return categoryService.findById(id)
@@ -124,6 +152,28 @@ public class CategoryController {
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
+    /**
+     * Svuota una categoria: per categorie reali i prodotti vanno nel cestino;
+     * per "In offerta" / "Nuovi prodotti" vengono tolti solo i flag virtuali.
+     */
+    @PostMapping("/{id}/empty-products")
+    public ResponseEntity<?> emptyCategoryProducts(@PathVariable Long id) {
+        return categoryService.findById(id)
+                .map(category -> {
+                    try {
+                        int affected = productService.emptyCategoryContents(id);
+                        return ResponseEntity.ok(Map.of(
+                                "categoryId", id,
+                                "categoryName", category.getNome() != null ? category.getNome() : "",
+                                "affected", affected
+                        ));
+                    } catch (IllegalArgumentException e) {
+                        return ResponseEntity.badRequest().body(e.getMessage());
+                    }
+                })
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
     @DeleteMapping("/{id}")
     public ResponseEntity<?> delete(@PathVariable Long id) {
         return categoryService.findById(id)
@@ -136,9 +186,9 @@ public class CategoryController {
                                 categoryService.save(c);
                             });
 
-                    // 2) elimina tutti i prodotti che appartengono a questa categoria
+                    // 2) sposta i prodotti nel cestino (soft delete) invece di eliminarli definitivamente
                     productRepository.findByCategoriaId(id)
-                            .forEach(productRepository::delete);
+                            .forEach(p -> productService.softDeleteById(p.getId()));
 
                     // 3) elimina la categoria
                     categoryService.deleteById(id);

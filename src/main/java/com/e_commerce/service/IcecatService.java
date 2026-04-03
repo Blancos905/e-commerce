@@ -77,8 +77,8 @@ public class IcecatService {
     @Value("${icecat.cache-path:./storage/icecat-cache}")
     private String cachePath;
 
-    /** Path classpath dell'immagine di default (da public "immagine nn disponibile.png") */
-    private static final String DEFAULT_IMAGE_CLASSPATH = "/static/images/immagine-non-disponibile.png";
+    /** Path classpath dell'immagine di default usata quando Icecat non trova immagini. */
+    private static final String DEFAULT_IMAGE_CLASSPATH = "/static/images/immagine-non-disponibile.svg";
     /** Marker in cache per capire che l'immagine salvata è quella di default (non immagini Icecat). */
     private static final String DEFAULT_IMAGE_CACHE_MARKER = "icecat-default-image-marker.txt";
 
@@ -141,7 +141,8 @@ public class IcecatService {
                 String e = imageUrl.substring(dot).split("[?]")[0].toLowerCase();
                 if (e.matches("\\.(jpeg|jpg|png|gif|webp)")) ext = e;
             }
-            String filename = "img_" + index + ext;
+            // Nome stabile basato su URL: evita overwrite e permette deduplica tra sync ripetute.
+            String filename = "img_" + Integer.toHexString(imageUrl.hashCode()) + ext;
 
             HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
             HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
@@ -187,7 +188,7 @@ public class IcecatService {
             }
             Path productDir = Paths.get(storagePath, String.valueOf(productId), "images");
             Files.createDirectories(productDir);
-            String filename = "img_0.png";
+            String filename = DEFAULT_IMAGE_CLASSPATH.toLowerCase().endsWith(".svg") ? "img_0.svg" : "img_0.png";
             Path filePath = productDir.resolve(filename);
             Files.copy(is, filePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             return "/api/images/product/" + productId + "/" + filename;
@@ -218,6 +219,30 @@ public class IcecatService {
         return s.replaceAll("[\\\\/:*?\"<>|\\s]+", "_").replaceAll("_+", "_");
     }
 
+    private boolean isManualImageDoc(Document d) {
+        if (d == null) return false;
+        if (d.getTipo() != null && "immagine_manual".equalsIgnoreCase(d.getTipo())) return true;
+        // Backward compat: vecchie immagini manuali usavano tipo="immagine" ma avevano filename "manual_...".
+        String url = d.getUrl();
+        return url != null && url.contains("/manual_");
+    }
+
+    private boolean isIcecatImageDoc(Document d) {
+        if (d == null || d.getTipo() == null) return false;
+        return "immagine".equalsIgnoreCase(d.getTipo()) && !isManualImageDoc(d);
+    }
+
+    private boolean hasManualImages(Product product) {
+        if (product == null || product.getDocumenti() == null) return false;
+        return product.getDocumenti().stream().anyMatch(this::isManualImageDoc);
+    }
+
+    private boolean hasDescription(Product product) {
+        return product != null
+                && product.getDescrizione() != null
+                && !product.getDescrizione().trim().isEmpty();
+    }
+
     /**
      * Copia immagini dalla cache al prodotto. Ritorna numero di immagini copiate o -1 se cache vuota.
      */
@@ -225,15 +250,11 @@ public class IcecatService {
         Path cacheDir = Paths.get(cachePath != null ? cachePath : "./storage/icecat-cache", cacheKey);
         if (!Files.isDirectory(cacheDir)) return -1;
         Path productDir = Paths.get(storagePath, String.valueOf(product.getId()), "images");
-        // Rimuovi vecchie immagini prima di copiare dalla cache
-        List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
-                .filter(d -> d.getTipo() != null && "immagine".equalsIgnoreCase(d.getTipo()))
-                .collect(Collectors.toList());
-        for (Document d : toRemove) {
-            product.getDocumenti().remove(d);
-            documentRepository.delete(d);
-        }
         int count = 0;
+        int maxOrdine = product.getDocumenti().stream()
+                .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
+                .max(Integer::compareTo)
+                .orElse(-1);
         for (int i = 0; i < MAX_IMAGES_PER_PRODUCT; i++) {
             Path src = findImageByIndex(cacheDir, i);
             if (src == null) break;
@@ -243,10 +264,16 @@ public class IcecatService {
                 String filename = "img_" + i + ext;
                 Path dest = productDir.resolve(filename);
                 Files.copy(src, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                String localUrl = "/api/images/product/" + product.getId() + "/" + filename;
+                boolean alreadyLinked = product.getDocumenti().stream()
+                        .anyMatch(d -> d != null && localUrl.equals(d.getUrl()));
+                if (alreadyLinked) {
+                    continue;
+                }
                 Document doc = new Document();
                 doc.setTipo("immagine");
-                doc.setUrl("/api/images/product/" + product.getId() + "/" + filename);
-                doc.setOrdine(i);
+                doc.setUrl(localUrl);
+                doc.setOrdine(++maxOrdine);
                 doc.setProduct(product);
                 documentRepository.save(doc);
                 product.getDocumenti().add(doc);
@@ -256,7 +283,8 @@ public class IcecatService {
             }
         }
         Path descFile = cacheDir.resolve("descrizione.txt");
-        if (Files.isRegularFile(descFile)) {
+        // Se l'utente ha immagini manuali, preserviamo la descrizione manuale e non sovrascriviamo da cache.
+        if (!hasManualImages(product) && !hasDescription(product) && Files.isRegularFile(descFile)) {
             try {
                 product.setDescrizione(Files.readString(descFile));
             } catch (IOException e) {
@@ -345,19 +373,23 @@ public class IcecatService {
      */
     private int addDefaultImageIfConfigured(Product product) {
         Long productId = product.getId();
-        List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
-                .filter(d -> d.getTipo() != null && "immagine".equalsIgnoreCase(d.getTipo()))
-                .collect(Collectors.toList());
-        for (Document d : toRemove) {
-            product.getDocumenti().remove(d);
-            documentRepository.delete(d);
-        }
         String localPath = copyDefaultImageToStorage(productId);
         if (localPath != null) {
+            boolean alreadyLinked = product.getDocumenti() != null && product.getDocumenti().stream()
+                    .anyMatch(d -> d != null && localPath.equals(d.getUrl()));
+            if (alreadyLinked) {
+                return 0;
+            }
+            int maxOrdine = product.getDocumenti() != null
+                    ? product.getDocumenti().stream()
+                    .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
+                    .max(Integer::compareTo)
+                    .orElse(-1)
+                    : -1;
             Document doc = new Document();
             doc.setTipo("immagine");
             doc.setUrl(localPath);
-            doc.setOrdine(0);
+            doc.setOrdine(maxOrdine + 1);
             doc.setProduct(product);
             documentRepository.save(doc);
             product.getDocumenti().add(doc);
@@ -662,6 +694,26 @@ public class IcecatService {
     }
 
     /**
+     * Riduce il rumore nelle query da listino (es. "pc", "gb", "w11", risoluzioni, ecc.)
+     * mantenendo i token utili al match (marca/modello/cpu).
+     */
+    private String buildFocusedSearchTerm(String norm) {
+        if (norm == null || norm.isBlank()) return "";
+        List<String> kept = new ArrayList<>();
+        for (String w : norm.split("\\s+")) {
+            if (w == null || w.isBlank()) continue;
+            String t = w.trim();
+            // stopword e rumore frequente nei listini
+            if (t.matches("^(pc|aio|allinone|all-in-one|desktop|notebook|laptop|mini|monitor|ref|new|nero|black|white)$")) continue;
+            if (t.matches("^(gb|tb|ssd|hdd|ram|ddr3|ddr4|ddr5|fhd|uhd|hd|wifi|bt|lan|win|windows|w10|w11|w11pe|pro)$")) continue;
+            // Token troppo corti senza cifre sono poco utili
+            if (t.length() < 3 && !t.matches(".*\\d.*")) continue;
+            kept.add(t);
+        }
+        return String.join(" ", kept).trim();
+    }
+
+    /**
      * Genera molte varianti del nome per ricerca molto permissiva: nome completo, parole singole,
      * sottostringhe, modelli, codici, prime N parole. Aggiunge coppie tipo "dome 5mp" per prodotti CCTV/telecamere.
      */
@@ -671,6 +723,11 @@ public class IcecatService {
         String norm = normalizeForMatch(productName);
         if (norm.length() < 1) return variants;
         variants.add(norm);
+
+        String focused = buildFocusedSearchTerm(norm);
+        if (!focused.isBlank() && !variants.contains(focused)) {
+            variants.add(focused);
+        }
 
         String[] words = norm.split("\\s+");
         for (String w : words) {
@@ -687,6 +744,27 @@ public class IcecatService {
         if (kw.length() >= 2 && !variants.contains(kw)) variants.add(kw);
         String ml = modelLike.toString().trim();
         if (ml.length() >= 2 && !variants.contains(ml)) variants.add(ml);
+
+        // Varianti tecniche utili: codici modello/cpu/piattaforma (es. "vz2594g", "24iap7", "i5-1235u")
+        for (String w : words) {
+            if (w == null || w.isBlank()) continue;
+            if (w.matches(".*\\d.*") && w.length() >= 4 && !variants.contains(w)) {
+                variants.add(w);
+            }
+        }
+
+        // Coppiе altamente informative (es. "lenovo 24iap7", "i5-1235u 24iap7")
+        if (!focused.isBlank()) {
+            String[] fw = focused.split("\\s+");
+            for (int i = 0; i < fw.length; i++) {
+                for (int j = i + 1; j < fw.length; j++) {
+                    if ((fw[i].matches(".*\\d.*") || fw[j].matches(".*\\d.*")) && fw[i].length() >= 2 && fw[j].length() >= 2) {
+                        String pair = fw[i] + " " + fw[j];
+                        if (!variants.contains(pair)) variants.add(pair);
+                    }
+                }
+            }
+        }
 
         for (int take = 2; take <= Math.min(5, words.length); take++) {
             StringBuilder sb = new StringBuilder();
@@ -841,12 +919,16 @@ public class IcecatService {
 
                 candidates.sort(Comparator.comparingDouble((IndexCandidate c) -> c.score).reversed());
 
+                IcecatData bestWithDescription = null;
                 for (IndexCandidate c : candidates) {
                     if (c.productId != null && !c.productId.isEmpty() && c.productId.matches("\\d+")) {
                         IcecatData d = fetchProductDataByIcecatId(Long.parseLong(c.productId));
                         if (d != null && !d.imageUrls().isEmpty()) {
                             log.info("Icecat: trovato per nome '{}' (più simile: '{}', score={})", productName, c.modelName, String.format("%.2f", c.score));
                             return d;
+                        }
+                        if (bestWithDescription == null && d != null && d.description() != null && !d.description().isBlank()) {
+                            bestWithDescription = d;
                         }
                     }
                     if (c.vendor != null && !c.vendor.isEmpty() && c.prodId != null && !c.prodId.isEmpty()) {
@@ -855,7 +937,14 @@ public class IcecatService {
                             log.info("Icecat: trovato per nome '{}' (più simile: '{}', score={})", productName, c.modelName, String.format("%.2f", c.score));
                             return d;
                         }
+                        if (bestWithDescription == null && d != null && d.description() != null && !d.description().isBlank()) {
+                            bestWithDescription = d;
+                        }
                     }
+                }
+                if (bestWithDescription != null) {
+                    log.info("Icecat: trovato per nome '{}' senza immagini ma con descrizione", productName);
+                    return bestWithDescription;
                 }
             }
         } catch (Exception e) {
@@ -1081,18 +1170,10 @@ public class IcecatService {
         return url;
     }
 
-    /**
-     * Verifica che una descrizione sia "utile" per il catalogo:
-     * - non nulla/vuota
-     * - non troppo corta
-     * - non contenga messaggi generici tipo "no description".
-     */
     private boolean isValidDescription(String desc) {
         if (desc == null) return false;
         String s = desc.trim();
         if (s.isEmpty()) return false;
-        // Evita descrizioni troppo brevi o generiche
-        if (s.length() < 20) return false;
         String lower = s.toLowerCase();
         if (lower.contains("no description") || lower.contains("no product description")) return false;
         return true;
@@ -1223,7 +1304,9 @@ public class IcecatService {
         }
         // Prodotto trovato su Icecat ma senza immagini: importa almeno la descrizione
         if (data.imageUrls().isEmpty()) {
-            if (data.description() != null && !data.description().isBlank()) {
+            if (!hasManualImages(product)
+                    && !hasDescription(product)
+                    && data.description() != null && !data.description().isBlank()) {
                 product.setDescrizione(data.description());
                 try {
                     Path descFile = Paths.get(storagePath, String.valueOf(productId), "descrizione.txt");
@@ -1242,26 +1325,27 @@ public class IcecatService {
 
         int added = 0;
 
-        // Se ci sono immagini, aggiorna i documenti; altrimenti lascia le immagini come sono
+        // Se ci sono immagini, aggiungi solo le nuove senza sovrascrivere i documenti esistenti
         if (data.imageUrls() != null && !data.imageUrls().isEmpty()) {
-            // Rimuovi vecchie immagini (Icecat URL o locali)
-            List<Document> toRemove = new ArrayList<>(product.getDocumenti()).stream()
-                    .filter(d -> d.getTipo() != null && "immagine".equalsIgnoreCase(d.getTipo()))
-                    .collect(Collectors.toList());
-            for (Document d : toRemove) {
-                product.getDocumenti().remove(d);
-                documentRepository.delete(d);
-            }
+            int maxOrdine = product.getDocumenti().stream()
+                    .map(d -> d.getOrdine() != null ? d.getOrdine() : -1)
+                    .max(Integer::compareTo)
+                    .orElse(-1);
 
-            // Scarica immagini e salva path locale (max 3, ordine 0, 1, 2 per poter scegliere la principale)
+            // Scarica immagini e salva path locale (max 3 candidate per sync)
             int limit = Math.min(data.imageUrls().size(), MAX_IMAGES_PER_PRODUCT);
             for (int i = 0; i < limit; i++) {
                 String localPath = downloadImageToStorage(data.imageUrls().get(i), productId, i);
                 if (localPath != null) {
+                    boolean alreadyLinked = product.getDocumenti().stream()
+                            .anyMatch(d -> d != null && localPath.equals(d.getUrl()));
+                    if (alreadyLinked) {
+                        continue;
+                    }
                     Document doc = new Document();
                     doc.setTipo("immagine");
                     doc.setUrl(localPath);
-                    doc.setOrdine(i);
+                    doc.setOrdine(++maxOrdine);
                     doc.setProduct(product);
                     documentRepository.save(doc);
                     product.getDocumenti().add(doc);
@@ -1276,7 +1360,9 @@ public class IcecatService {
         }
 
         // Aggiorna descrizione anche se non ci sono immagini
-        if (data.description() != null && !data.description().isBlank()) {
+        if (!hasManualImages(product)
+                && !hasDescription(product)
+                && data.description() != null && !data.description().isBlank()) {
             product.setDescrizione(data.description());
             try {
                 Path descFile = Paths.get(storagePath, String.valueOf(productId), "descrizione.txt");

@@ -21,10 +21,13 @@ public class ProductUpdateRequest {
     private String codiceProduttore;
 
     private BigDecimal prezzoBase;
+    private BigDecimal prezzoOfferta;
 
     private Double aumentoPercentuale;
 
     private Long categoriaId;
+
+    private Boolean inOfferta;
 
     /** Accetta stringa (es. "10,50" o "10.50") o numero per evitare errori di deserializzazione. */
     @JsonSetter
@@ -50,6 +53,32 @@ public class ProductUpdateRequest {
             this.prezzoBase = new BigDecimal(s);
         } catch (NumberFormatException e) {
             this.prezzoBase = null;
+        }
+    }
+
+    @JsonSetter
+    public void setPrezzoOfferta(Object value) {
+        if (value == null) {
+            this.prezzoOfferta = null;
+            return;
+        }
+        if (value instanceof BigDecimal) {
+            this.prezzoOfferta = (BigDecimal) value;
+            return;
+        }
+        if (value instanceof Number) {
+            this.prezzoOfferta = BigDecimal.valueOf(((Number) value).doubleValue());
+            return;
+        }
+        String s = value.toString().trim().replace(',', '.');
+        if (s.isEmpty()) {
+            this.prezzoOfferta = null;
+            return;
+        }
+        try {
+            this.prezzoOfferta = new BigDecimal(s);
+        } catch (NumberFormatException e) {
+            this.prezzoOfferta = null;
         }
     }
 }

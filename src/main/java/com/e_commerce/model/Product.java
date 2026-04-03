@@ -5,6 +5,7 @@ import lombok.Data;
 import org.hibernate.annotations.BatchSize;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -40,6 +41,10 @@ public class Product {
     @Column
     private BigDecimal prezzoBase;
 
+    // prezzo promozionale usato nella vista "In offerta" (opzionale)
+    @Column
+    private BigDecimal prezzoOfferta;
+
     // prezzo finale calcolato con gli aumenti (può essere assente se non c'è prezzo base)
     @Column
     private BigDecimal prezzoFinale;
@@ -62,6 +67,13 @@ public class Product {
     @Column(nullable = false, columnDefinition = "boolean default false")
     private Boolean nuovoManuale = false;
 
+    /**
+     * Flag "virtuale" per la categoria "In offerta".
+     * Il prodotto mantiene la sua categoria principale e compare anche in Offerta.
+     */
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private Boolean inOfferta = false;
+
     /** CON = contati (stock contato dal fornitore) */
     @Column(length = 64)
     private String contati;
@@ -74,4 +86,11 @@ public class Product {
     @OneToMany(mappedBy = "product", cascade = CascadeType.ALL, orphanRemoval = true)
     @OrderBy("ordine ASC")
     private List<Document> documenti = new ArrayList<>();
+
+    /** Soft delete: prodotto nascosto dal catalogo ma recuperabile. */
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private Boolean deleted = false;
+
+    /** Timestamp soft delete (null = attivo). */
+    private LocalDateTime deletedAt;
 }

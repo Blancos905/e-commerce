@@ -15,7 +15,19 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CancellationException;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/suppliers")
@@ -52,6 +64,206 @@ public class SupplierController {
         }
         List<ImportLogSummaryDTO> logs = importLogRepository.findSummariesBySupplierIdOrderByImportedAtDesc(id);
         return ResponseEntity.ok(logs);
+    }
+
+    /**
+     * Scrape offerte Takefive: genera un CSV e lo restituisce al frontend per l'anteprima.
+     * Non importa automaticamente nel catalogo (l'utente sceglie poi "Salva in cartella").
+     */
+    @PostMapping("/{id}/scrape-offers")
+    public ResponseEntity<?> scrapeOffers(@PathVariable Long id,
+                                          @RequestParam(value = "fileName", required = false) String fileName) {
+        var supplierOpt = supplierService.findById(id);
+        if (supplierOpt.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        Supplier supplier = supplierOpt.get();
+
+        String supplierName = supplier.getNome() != null ? supplier.getNome().trim() : "";
+        if (!"takefive".equalsIgnoreCase(supplierName)) {
+            return ResponseEntity.badRequest().body(java.util.Map.of(
+                    "error", "Scraping offerte disponibile solo per il fornitore Takefive",
+                    "supplierId", id,
+                    "supplierName", supplierName
+            ));
+        }
+
+        String desiredName = computeDesiredOfferFileName(id, fileName);
+
+        String pythonExe = "C:\\Python310\\python.exe";
+        String pythonScript = "C:\\Users\\CostantinoM\\scrape_takefive.py";
+        Path outputDir = Paths.get("C:\\Users\\CostantinoM\\Desktop\\takefive_csv");
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder(pythonExe, pythonScript);
+            pb.redirectErrorStream(true);
+            Process proc = pb.start();
+
+            StringBuilder logs = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    logs.append(line).append('\n');
+                }
+            }
+
+            int exitCode = proc.waitFor();
+            if (exitCode != 0) {
+                String logText = logs.length() > 4000 ? logs.substring(logs.length() - 4000) : logs.toString();
+                return ResponseEntity.status(500).body(java.util.Map.of(
+                        "error", "Scrape Takefive fallito",
+                        "exitCode", exitCode,
+                        "logs", logText
+                ));
+            }
+
+            if (!Files.exists(outputDir)) {
+                return ResponseEntity.status(500).body(java.util.Map.of(
+                        "error", "Cartella output scraper non trovata",
+                        "outputDir", outputDir.toString()
+                ));
+            }
+
+            try (java.util.stream.Stream<Path> stream = Files.list(outputDir)) {
+                List<Path> csvFiles = stream
+                        .filter(p -> p.getFileName() != null && p.getFileName().toString().toLowerCase().endsWith(".csv"))
+                        .sorted(Comparator.comparingLong((Path p) -> p.toFile().lastModified()).reversed())
+                        .collect(Collectors.toList());
+
+                if (csvFiles.isEmpty()) {
+                    return ResponseEntity.status(500).body(java.util.Map.of(
+                            "error", "Nessun CSV prodotto dallo scraper",
+                            "outputDir", outputDir.toString()
+                    ));
+                }
+
+                Path latest = csvFiles.get(0);
+                byte[] bytes = Files.readAllBytes(latest);
+                String base64 = Base64.getEncoder().encodeToString(bytes);
+
+                return ResponseEntity.ok(java.util.Map.of(
+                        "fileName", desiredName,
+                        "fileContentType", "text/csv",
+                        "fileContentBase64", base64
+                ));
+            }
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body(java.util.Map.of(
+                    "error", "Errore durante lo scrape Takefive: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName())
+            ));
+        }
+    }
+
+    private String computeDesiredOfferFileName(Long supplierId, String requested) {
+        String cleaned = sanitizeCsvFileName(requested);
+        if (cleaned != null) {
+            return cleaned;
+        }
+        // Auto: offerta1.csv, offerta2.csv, ...
+        int next = nextOffertaIndex(supplierId);
+        return "offerta" + next + ".csv";
+    }
+
+    private String sanitizeCsvFileName(String requested) {
+        if (requested == null) return null;
+        String s = requested.trim();
+        if (s.isEmpty()) return null;
+
+        // Replace invalid Windows filename chars, collapse spaces
+        s = s.replaceAll("[\\\\/:*?\"<>|]", "_").replaceAll("\\s+", " ").trim();
+        if (s.isEmpty()) return null;
+
+        // Enforce .csv extension
+        if (!s.toLowerCase().endsWith(".csv")) {
+            s = s + ".csv";
+        }
+
+        // Avoid crazy long names
+        if (s.length() > 80) {
+            s = s.substring(0, 80);
+            if (!s.toLowerCase().endsWith(".csv")) {
+                s = s.replaceAll("\\.+$", "");
+                s = s + ".csv";
+            }
+        }
+        return s;
+    }
+
+    private int nextOffertaIndex(Long supplierId) {
+        try {
+            List<ImportLogSummaryDTO> logs = importLogRepository.findSummariesBySupplierIdOrderByImportedAtDesc(supplierId);
+            if (logs == null || logs.isEmpty()) return 1;
+            Pattern p = Pattern.compile("(?i)^offerta\\s*(\\d+)\\.csv$");
+            int max = 0;
+            for (ImportLogSummaryDTO dto : logs) {
+                if (dto == null) continue;
+                String name = dto.fileName();
+                if (name == null) continue;
+                Matcher m = p.matcher(name.trim());
+                if (m.matches()) {
+                    try {
+                        int n = Integer.parseInt(m.group(1));
+                        if (n > max) max = n;
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+            return max + 1;
+        } catch (Exception ignored) {
+            return 1;
+        }
+    }
+
+    @GetMapping("/{id}/imports/compare")
+    public ResponseEntity<?> compareImports(@PathVariable Long id,
+                                            @RequestParam("leftImportId") Long leftImportId,
+                                            @RequestParam("rightImportId") Long rightImportId) {
+        if (supplierService.findById(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        ImportLog left = importLogRepository.findById(leftImportId).orElse(null);
+        ImportLog right = importLogRepository.findById(rightImportId).orElse(null);
+        if (left == null || right == null) {
+            return ResponseEntity.badRequest().body("Uno o entrambi gli import selezionati non esistono.");
+        }
+        if (left.getSupplier() == null || right.getSupplier() == null
+                || !id.equals(left.getSupplier().getId()) || !id.equals(right.getSupplier().getId())) {
+            return ResponseEntity.badRequest().body("Puoi comparare solo CSV dello stesso fornitore.");
+        }
+        if (!"PRODOTTI".equalsIgnoreCase(left.getTipo()) || !"PRODOTTI".equalsIgnoreCase(right.getTipo())) {
+            return ResponseEntity.badRequest().body("La comparazione è supportata solo per CSV di tipo PRODOTTI.");
+        }
+        try {
+            Map<String, Object> result = importService.compareProductImportLogs(left, right);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body("Errore durante la comparazione CSV: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+    }
+
+    @GetMapping("/{id}/imports/{importId}/compare-db")
+    public ResponseEntity<?> compareImportWithDatabase(@PathVariable Long id, @PathVariable Long importId) {
+        if (supplierService.findById(id).isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
+        ImportLog csvImport = importLogRepository.findById(importId).orElse(null);
+        if (csvImport == null || csvImport.getSupplier() == null || !id.equals(csvImport.getSupplier().getId())) {
+            return ResponseEntity.badRequest().body("Import non trovato per il fornitore selezionato.");
+        }
+        if (!"PRODOTTI".equalsIgnoreCase(csvImport.getTipo())) {
+            return ResponseEntity.badRequest().body("La comparazione con database è supportata solo per CSV di tipo PRODOTTI.");
+        }
+        try {
+            Map<String, Object> result = importService.compareImportLogWithDatabase(csvImport);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError()
+                    .body("Errore durante la comparazione CSV vs database: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
     }
 
     @PostMapping("/{id}/imports")

@@ -27,6 +27,7 @@ public class ProductRevisionDTO {
     private String marca;
     private String codiceProduttore;
     private BigDecimal prezzoBase;
+    private BigDecimal prezzoOfferta;
     private BigDecimal prezzoFinale;
     private Double aumentoPercentuale;
     private Long categoriaId;

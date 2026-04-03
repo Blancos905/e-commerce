@@ -23,7 +23,9 @@ public class ProductSnapshotDTO {
     private String nome;
     private String descrizione;
     private BigDecimal prezzoBase;
+    private BigDecimal prezzoOfferta;
     private BigDecimal prezzoFinale;
+    private Boolean inOfferta;
     private Double aumentoPercentuale;
     private Long categoriaId;
     private Long supplierId;

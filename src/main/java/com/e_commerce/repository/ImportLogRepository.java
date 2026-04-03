@@ -27,6 +27,18 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
             """)
     List<ImportLogSummaryDTO> findSummariesBySupplierIdOrderByImportedAtDesc(@Param("supplierId") Long supplierId);
 
+    @Query("""
+            select l
+            from ImportLog l
+            where l.supplier.id = :supplierId
+              and upper(l.tipo) = 'PRODOTTI'
+              and l.id <> :currentImportId
+            order by l.importedAt desc
+            """)
+    List<ImportLog> findPreviousProductImportsForSupplier(@Param("supplierId") Long supplierId,
+                                                          @Param("currentImportId") Long currentImportId,
+                                                          org.springframework.data.domain.Pageable pageable);
+
     boolean existsByIdAndSupplierId(Long id, Long supplierId);
 
     Optional<ImportLog> findFirstByAppliedAtNotNullOrderByAppliedAtDesc();
@@ -55,7 +67,7 @@ public interface ImportLogRepository extends JpaRepository<ImportLog, Long> {
      * Reset catalogo: per coerenza con l'utente, azzera lo "stato applicato" degli import PRODOTTI.
      * In questo modo `canRollbackLastImport` e la lista `/products/applied-imports` diventano vuote.
      */
-    @Modifying
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("update ImportLog l set l.appliedAt = null, l.previousStateJson = null where l.tipo = 'PRODOTTI' and l.appliedAt is not null")
     int clearAppliedProductImports();
 }

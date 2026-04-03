@@ -44,23 +44,35 @@ public class MagentoService {
     private static final Logger log = LoggerFactory.getLogger(MagentoService.class);
 
     /**
-     * Mappa nome categoria catalogo virtuale → ID categoria Magento.
-     * Allineato alle categorie su Magento: Default Category (2), Videosorveglianza (35), Multimedia (36), Cavi (38),
-     * Computer (39), Accessori (34), Best Seller (41), Elettronica (42), Scuola e laboratori (33), Ufficio (37), Networking (32).
+     * Mappa nome categoria catalogo virtuale -> ID categoria Magento.
+     * IDs forniti dal catalogo Magento:
+     * - Default Category: 2
+     * - Offerte: 43
+     * - Elettronica: 42
+     * - Best Seller: 41
+     * - Computer: 39
+     * - Ufficio: 37
+     * - Videosorveglianza: 35
+     * - Scuola e laboratori: 33
+     * - Cavi: 38
+     * - Multimedia: 36
+     * - Accessori: 34
+     * - Networking: 32
      */
     private static final Map<String, String> CATEGORY_TO_MAGENTO_ID = Map.ofEntries(
-            Map.entry("Best sellers", "41"),
-            Map.entry("Best Seller", "41"),
-            Map.entry("Videosorveglianza", "35"),
-            Map.entry("Cavi", "38"),
-            Map.entry("Computer", "39"),
-            Map.entry("Accessori", "34"),
-            Map.entry("Ufficio", "37"),
-            Map.entry("Networking", "32"),
-            Map.entry("Scuola e laboratori", "33"),
-            Map.entry("Scuola e Laboratori", "33"),
-            Map.entry("Elettronica", "42"),
-            Map.entry("Multimedia", "36")
+            Map.entry("offerte", "43"),
+            Map.entry("in offerta", "43"),
+            Map.entry("elettronica", "42"),
+            Map.entry("best seller", "41"),
+            Map.entry("best sellers", "41"),
+            Map.entry("computer", "39"),
+            Map.entry("ufficio", "37"),
+            Map.entry("videosorveglianza", "35"),
+            Map.entry("scuola e laboratori", "33"),
+            Map.entry("cavi", "38"),
+            Map.entry("multimedia", "36"),
+            Map.entry("accessori", "34"),
+            Map.entry("networking", "32")
     );
 
     /** ID categoria Magento usato quando il prodotto non ha categoria o non è nella mappa (Default Category). */
@@ -169,10 +181,21 @@ public class MagentoService {
                     result.incrementCreated();
                 }
 
-                // Per nuovi e aggiornati: carica/aggiorna l'immagine primaria (Base/Small/Thumbnail/Swatch).
+                // Alcune installazioni Magento/MSI ignorano stock_item nel payload prodotto:
+                // forziamo l'allineamento quantità con endpoint stock dedicato.
+                try {
+                    String skuForStock = effectiveSkuForMagento(p);
+                    if (skuForStock != null) {
+                        updateStockBySku(base, skuForStock, parseStock(p.getDisponibilita()));
+                    }
+                } catch (Exception stockEx) {
+                    log.warn("Magento stock: update esplicito fallito per SKU {}: {}", effectiveSkuForMagento(p), stockEx.getMessage());
+                }
+
+                // Per nuovi e aggiornati: sincronizza le immagini locali (prima = principale, altre in gallery).
                 if (uploadImagesToMagento) {
                     checkCancelled();
-                    boolean uploaded = syncPrimaryImageIfPresent(base, p);
+                    boolean uploaded = syncProductImagesIfPresent(base, p);
                     if (uploaded) {
                         result.incrementImagesUploaded();
                     }
@@ -216,7 +239,7 @@ public class MagentoService {
                     result.addError(sku, "Prodotto non presente su Magento, salto upload immagine");
                     continue;
                 }
-                boolean uploaded = syncPrimaryImageIfPresent(base, p);
+                boolean uploaded = syncProductImagesIfPresent(base, p);
                 if (uploaded) {
                     result.incrementImagesUploaded();
                 } else {
@@ -230,17 +253,85 @@ public class MagentoService {
         return result;
     }
 
-    private boolean syncPrimaryImageIfPresent(String base, Product p) throws Exception {
+    /**
+     * Nome file da usare su Magento: se il nome locale è già occupato da un'altra immagine,
+     * aggiunge un suffisso dal hash così la nuova media non sostituisce la vecchia in galleria.
+     */
+    private static String decideMagentoUploadFilename(String localFilename, String contentHash, Set<String> existingNamesLower) {
+        if (localFilename == null || localFilename.isBlank()) {
+            return "image_" + (contentHash.length() >= 8 ? contentHash.substring(0, 8) : contentHash) + ".jpg";
+        }
+        if (!existingNamesLower.contains(localFilename.toLowerCase(Locale.ROOT))) {
+            return localFilename;
+        }
+        int dot = localFilename.lastIndexOf('.');
+        String base = dot > 0 ? localFilename.substring(0, dot) : localFilename;
+        String ext = dot > 0 ? localFilename.substring(dot) : "";
+        String suffix = contentHash.length() >= 8 ? contentHash.substring(0, 8) : contentHash;
+        for (int i = 0; i < 1000; i++) {
+            String candidate = i == 0 ? base + "_" + suffix + ext : base + "_" + suffix + "_" + i + ext;
+            if (!existingNamesLower.contains(candidate.toLowerCase(Locale.ROOT))) {
+                return candidate;
+            }
+        }
+        return base + "_" + System.currentTimeMillis() + ext;
+    }
+
+    private boolean syncProductImagesIfPresent(String base, Product p) throws Exception {
         if (p == null || p.getId() == null) return false;
         String sku = effectiveSkuForMagento(p);
         if (sku == null) return false;
 
-        Path imgPath = resolvePrimaryLocalImagePath(p);
-        if (imgPath == null || !Files.isRegularFile(imgPath)) {
+        List<Path> imagePaths = resolveLocalImagePaths(p);
+        if (imagePaths.isEmpty()) {
             log.info("Magento immagine: nessuna immagine locale trovata per SKU {} (productId={}) in {}", sku, p.getId(), icecatStoragePath);
             return false;
         }
 
+        boolean anyUploaded = false;
+        for (int i = 0; i < imagePaths.size(); i++) {
+            Path imgPath = imagePaths.get(i);
+            boolean setAsPrimary = (i == 0);
+            boolean uploaded = uploadSingleImage(base, p, imgPath, setAsPrimary);
+            if (uploaded) anyUploaded = true;
+        }
+        return anyUploaded;
+    }
+
+    private List<Path> resolveLocalImagePaths(Product p) {
+        List<Path> result = new ArrayList<>();
+        Path imagesDir = Paths.get(icecatStoragePath, String.valueOf(p.getId()), "images");
+        if (!Files.isDirectory(imagesDir)) return result;
+
+        for (String ext : new String[]{"jpg", "jpeg", "png", "webp", "gif", "svg"}) {
+            Path candidate = imagesDir.resolve("img_0." + ext);
+            if (Files.isRegularFile(candidate)) {
+                result.add(candidate);
+                break;
+            }
+        }
+        try (var stream = Files.list(imagesDir)) {
+            List<Path> all = stream
+                    .filter(Files::isRegularFile)
+                    .filter(pth -> {
+                        String n = pth.getFileName().toString().toLowerCase(Locale.ROOT);
+                        return n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png")
+                                || n.endsWith(".webp") || n.endsWith(".gif") || n.endsWith(".svg");
+                    })
+                    .sorted(Comparator.comparing(path -> path.getFileName().toString()))
+                    .toList();
+            for (Path pth : all) {
+                if (!result.contains(pth)) result.add(pth);
+            }
+        } catch (Exception e) {
+            log.debug("Magento immagine: fallback list immagini fallito per productId={}: {}", p.getId(), e.getMessage());
+        }
+        return result;
+    }
+
+    private boolean uploadSingleImage(String base, Product p, Path imgPath, boolean setAsPrimary) throws Exception {
+        String sku = effectiveSkuForMagento(p);
+        if (sku == null || imgPath == null || !Files.isRegularFile(imgPath)) return false;
         String filename = imgPath.getFileName().toString();
         log.info("Magento immagine: preparo upload per SKU {} (productId={}) file='{}'", sku, p.getId(), filename);
 
@@ -248,108 +339,68 @@ public class MagentoService {
         if (localBytes.length == 0) return false;
         String localHash = sha256Hex(localBytes);
 
-        // Se su Magento esiste già la media con lo stesso name ma con ruoli incompleti,
-        // la cancelliamo e la reinseriamo con i types corretti. Se l'immagine è identica (stesso hash) non re-importiamo.
-        Set<String> requiredTypes = Set.of("image", "small_image", "thumbnail", "swatch_image");
-        boolean hasCompleteTypesForThisFile = false;
-        boolean identicalImageAlreadyOnMagento = false;
-        List<Long> entryIdsToDelete = new ArrayList<>();
-
-        // Verifica se su Magento esiste già una media entry con lo stesso name
-        // Usiamo /rest/all/ per coprire correttamente multi-website/storeview.
         String listUrl = base + "/rest/all/V1/products/" + encode(sku) + "/media";
         String listJson = doGet(listUrl);
+
+        Set<String> existingNamesLower = new HashSet<>();
+        int maxPosition = 0;
+        boolean identicalAlreadyPresent = false;
+
         if (listJson != null && !listJson.isBlank()) {
             try {
                 JsonNode arr = objectMapper.readTree(listJson);
                 if (arr.isArray()) {
-                    for (JsonNode entry : arr) {
-                        String name = entry.path("name").asText(null);
-                        if (name == null || !name.equalsIgnoreCase(filename)) continue;
-
-                        // Se l'immagine su Magento è identica (stesso contenuto), non caricare un duplicato
-                        String filePath = entry.path("file").asText(null);
+                    for (JsonNode mediaEntry : arr) {
+                        String name = mediaEntry.path("name").asText(null);
+                        if (name != null && !name.isBlank()) {
+                            existingNamesLower.add(name.toLowerCase(Locale.ROOT));
+                        }
+                        maxPosition = Math.max(maxPosition, mediaEntry.path("position").asInt(0));
+                        String filePath = mediaEntry.path("file").asText(null);
                         if (filePath != null && !filePath.isBlank()) {
                             byte[] magentoBytes = fetchMediaImageBytes(base, filePath);
                             if (magentoBytes != null && magentoBytes.length > 0 && localHash.equals(sha256Hex(magentoBytes))) {
-                                identicalImageAlreadyOnMagento = true;
-                                log.info("Magento immagine: immagine identica già presente per SKU {} (file='{}'), skip upload", sku, filename);
-                                break;
+                                identicalAlreadyPresent = true;
                             }
-                        }
-
-                        // types potrebbe mancare o essere non array: in quel caso trattiamo l'entry come incompleta.
-                        Set<String> existingTypes = new HashSet<>();
-                        JsonNode typesNode = entry.path("types");
-                        if (typesNode.isArray()) {
-                            for (JsonNode t : typesNode) {
-                                existingTypes.add(t.asText());
-                            }
-                        }
-
-                        boolean hasAllRequired = existingTypes.containsAll(requiredTypes);
-                        if (hasAllRequired) {
-                            hasCompleteTypesForThisFile = true;
-                            break;
-                        }
-
-                        long entryId = entry.path("id").asLong(-1);
-                        if (entryId > 0) {
-                            entryIdsToDelete.add(entryId);
-                            // Log minimale: facciamo debug su cosa manca.
-                            Set<String> missing = new HashSet<>(requiredTypes);
-                            missing.removeAll(existingTypes);
-                            log.info("Magento immagine: ruoli incompleti su SKU {} per name='{}'. Mancano: {}", sku, filename, missing);
-                        } else {
-                            log.warn("Magento immagine: entry senza id trovata su SKU {} (name='{}'). In fallback: non possiamo cancellare, proseguiamo con upload (potenziali duplicati).", sku, filename);
                         }
                     }
                 }
-            } catch (Exception ignored) {
-                // se il parsing fallisce, proviamo comunque ad aggiungere
+            } catch (Exception e) {
+                log.debug("Magento immagine: parsing lista media fallito, proseguo con upload: {}", e.getMessage());
             }
         }
 
-        if (identicalImageAlreadyOnMagento) {
+        if (identicalAlreadyPresent) {
+            log.info("Magento immagine: contenuto già presente su Magento per SKU {}, skip upload", sku);
             return false;
         }
-        if (hasCompleteTypesForThisFile) {
-            log.info("Magento immagine: ruoli completi già presenti per SKU {} (file='{}'), skip upload", sku, filename);
+        if (existingNamesLower.contains(filename.toLowerCase(Locale.ROOT))) {
+            log.info("Magento immagine: nome '{}' già presente in gallery per SKU {}, skip upload", filename, sku);
             return false;
         }
 
-        // Se esiste l'entry ma è incompleta, la rimuoviamo per evitare che Magento continui a usare ruoli parziali.
-        for (Long entryId : entryIdsToDelete) {
-            if (entryId == null) continue;
-            String delUrl = base + "/rest/all/V1/products/" + encode(sku) + "/media/" + entryId;
-            int code = doDelete(delUrl);
-            if (code >= 400) {
-                throw new RuntimeException("Magento risposta DELETE media " + code);
-            }
-        }
-
-        String mime = guessMimeTypeFromFilename(filename);
+        String uploadFilename = decideMagentoUploadFilename(filename, localHash, existingNamesLower);
+        String mime = guessMimeTypeFromFilename(uploadFilename);
         String b64 = Base64.getEncoder().encodeToString(localBytes);
 
         ObjectNode content = objectMapper.createObjectNode();
         content.put("base64_encoded_data", b64);
         content.put("type", mime);
-        content.put("name", filename);
+        content.put("name", uploadFilename);
 
         ObjectNode entry = objectMapper.createObjectNode();
         entry.put("media_type", "image");
-        entry.put("label", p.getNome() != null ? p.getNome() : filename);
-        // Magento spesso assume position 1..N (più robusto di 0).
-        entry.put("position", 1);
+        entry.put("label", p.getNome() != null ? p.getNome() : uploadFilename);
+        entry.put("position", maxPosition + 1);
         entry.put("disabled", false);
-        // Campo "file" richiesto spesso da Magento REST per gestire ruoli/types correttamente.
-        entry.put("file", filename);
+        entry.put("file", uploadFilename);
         ArrayNode types = objectMapper.createArrayNode();
-        // Imposta l'immagine come base/small/thumbnail/swatch per tutte le viste
-        types.add("image");
-        types.add("small_image");
-        types.add("thumbnail");
-        types.add("swatch_image");
+        if (setAsPrimary) {
+            types.add("image");
+            types.add("small_image");
+            types.add("thumbnail");
+            types.add("swatch_image");
+        }
         entry.set("types", types);
         entry.set("content", content);
 
@@ -361,19 +412,8 @@ public class MagentoService {
         if (code >= 400) {
             throw new RuntimeException("Magento risposta " + code);
         }
-        log.info("Magento immagine: upload completato per SKU {} (file='{}')", sku, filename);
+        log.info("Magento immagine: upload completato per SKU {} (file='{}')", sku, uploadFilename);
         return true;
-    }
-
-    private Path resolvePrimaryLocalImagePath(Product p) {
-        // Icecat salva in: {icecat.storage-path}/{productId}/images/img_0.ext
-        Path imagesDir = Paths.get(icecatStoragePath, String.valueOf(p.getId()), "images");
-        if (!Files.isDirectory(imagesDir)) return null;
-        for (String ext : new String[]{"jpg", "jpeg", "png", "webp", "gif"}) {
-            Path candidate = imagesDir.resolve("img_0." + ext);
-            if (Files.isRegularFile(candidate)) return candidate;
-        }
-        return null;
     }
 
     private String guessMimeTypeFromFilename(String filename) {
@@ -382,6 +422,7 @@ public class MagentoService {
         if (f.endsWith(".png")) return "image/png";
         if (f.endsWith(".gif")) return "image/gif";
         if (f.endsWith(".webp")) return "image/webp";
+        if (f.endsWith(".svg")) return "image/svg+xml";
         if (f.endsWith(".jpeg")) return "image/jpeg";
         if (f.endsWith(".jpg")) return "image/jpeg";
         return "image/jpeg";
@@ -587,6 +628,38 @@ public class MagentoService {
         }
     }
 
+    /**
+     * Aggiornamento stock esplicito su endpoint Magento stockItems.
+     * Riduce i casi in cui quantity resta a 0 nonostante update prodotto.
+     */
+    private void updateStockBySku(String base, String sku, int qty) throws Exception {
+        String getUrl = base + "/rest/V1/stockItems/" + encode(sku);
+        String getJson = doGet(getUrl);
+        int itemId = 1;
+        if (getJson != null && !getJson.isBlank()) {
+            try {
+                JsonNode node = objectMapper.readTree(getJson);
+                int parsed = node.path("item_id").asInt(0);
+                if (parsed > 0) itemId = parsed;
+            } catch (Exception ignored) {
+                // fallback itemId=1
+            }
+        }
+
+        String putUrl = base + "/rest/V1/products/" + encode(sku) + "/stockItems/" + itemId;
+        ObjectNode stockItem = objectMapper.createObjectNode();
+        stockItem.put("qty", qty);
+        stockItem.put("is_in_stock", qty > 0);
+        ObjectNode payload = objectMapper.createObjectNode();
+        payload.set("stockItem", stockItem);
+        payload.put("saveOptions", true);
+
+        int code = doRequest("PUT", putUrl, objectMapper.writeValueAsString(payload));
+        if (code >= 400) {
+            throw new RuntimeException("Magento stockItems risposta " + code);
+        }
+    }
+
     private int doRequest(String method, String urlString, String body) throws Exception {
         URI uri = URI.create(urlString);
         HttpURLConnection conn = (HttpURLConnection) uri.toURL().openConnection();
@@ -719,7 +792,7 @@ public class MagentoService {
 
         int qty = parseStock(p.getDisponibilita());
         ObjectNode stockItem = objectMapper.createObjectNode();
-        stockItem.put("qty", String.valueOf(qty));
+        stockItem.put("qty", qty);
         stockItem.put("is_in_stock", qty > 0);
         ext.set("stock_item", stockItem);
 
@@ -757,7 +830,12 @@ public class MagentoService {
         if (p.getCategoria() == null || p.getCategoria().getNome() == null) {
             return MAGENTO_DEFAULT_CATEGORY_ID;
         }
-        return CATEGORY_TO_MAGENTO_ID.getOrDefault(p.getCategoria().getNome().trim(), MAGENTO_DEFAULT_CATEGORY_ID);
+        return CATEGORY_TO_MAGENTO_ID.getOrDefault(normalizeCategoryName(p.getCategoria().getNome()), MAGENTO_DEFAULT_CATEGORY_ID);
+    }
+
+    private String normalizeCategoryName(String name) {
+        if (name == null) return "";
+        return name.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
     }
 
     private int parseStock(String disponibilita) {
@@ -767,6 +845,15 @@ public class MagentoService {
         String s = disponibilita.trim();
         if (s.matches("\\d+")) {
             return Integer.parseInt(s);
+        }
+        // Supporta formati reali da listino: ">20", "5+", "10 pz", "disp: 7"
+        String digits = s.replaceAll("[^0-9]", "");
+        if (!digits.isBlank()) {
+            try {
+                return Integer.parseInt(digits);
+            } catch (NumberFormatException ignored) {
+                // fallback sotto
+            }
         }
         return s.equalsIgnoreCase("si") || s.equalsIgnoreCase("yes") || s.equalsIgnoreCase("disponibile") ? 99 : 0;
     }

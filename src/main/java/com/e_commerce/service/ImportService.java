@@ -3,6 +3,7 @@ package com.e_commerce.service;
 import com.e_commerce.dto.DocumentImportDTO;
 import com.e_commerce.dto.ProductImportDTO;
 import com.e_commerce.dto.ProductSnapshotDTO;
+import com.e_commerce.dto.ProductRevisionDTO;
 import com.e_commerce.dto.SupplierImportDTO;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -10,12 +11,15 @@ import com.e_commerce.model.Category;
 import com.e_commerce.model.Document;
 import com.e_commerce.model.ImportLog;
 import com.e_commerce.model.Product;
+import com.e_commerce.model.ProductRevision;
 import com.e_commerce.model.Supplier;
 import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.DocumentRepository;
 import com.e_commerce.repository.ProductRepository;
+import com.e_commerce.repository.ProductRevisionRepository;
 import com.e_commerce.repository.SupplierRepository;
 import com.e_commerce.repository.ImportLogRepository;
+import org.springframework.data.domain.PageRequest;
 import com.opencsv.CSVParserBuilder;
 import com.opencsv.CSVReader;
 import com.opencsv.CSVReaderBuilder;
@@ -40,14 +44,19 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
+import java.util.regex.Pattern;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.w3c.dom.Element;
@@ -71,6 +80,7 @@ public class ImportService {
     private final DocumentRepository documentRepository;
     private final SupplierRepository supplierRepository;
     private final ImportLogRepository importLogRepository;
+    private final ProductRevisionRepository productRevisionRepository;
     private final ProductService productService;
     private final ProductMatchingService productMatchingService;
     private final IcecatService icecatService;
@@ -90,6 +100,7 @@ public class ImportService {
                          DocumentRepository documentRepository,
                          SupplierRepository supplierRepository,
                          ImportLogRepository importLogRepository,
+                         ProductRevisionRepository productRevisionRepository,
                          ProductService productService,
                          ProductMatchingService productMatchingService,
                          IcecatService icecatService) {
@@ -98,6 +109,7 @@ public class ImportService {
         this.documentRepository = documentRepository;
         this.supplierRepository = supplierRepository;
         this.importLogRepository = importLogRepository;
+        this.productRevisionRepository = productRevisionRepository;
         this.productService = productService;
         this.productMatchingService = productMatchingService;
         this.icecatService = icecatService;
@@ -163,6 +175,7 @@ public class ImportService {
                 log.getFileName(),
                 log.getFileContentType()
         );
+        Map<String, Boolean> autoOfferByKey = computeAutoOfferFlagsFromPreviousImport(log, rows);
         Map<String, ProductSnapshotDTO> snapshot = new HashMap<>();
         for (ProductImportDTO dto : rows) {
             checkCancelled();
@@ -171,7 +184,7 @@ public class ImportService {
             String skuTruncated = truncate(sku, 255);
             productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> snapshot.put(skuTruncated, toSnapshot(p)));
         }
-        processProductRows(rows, log.getSupplier(), log.getFileName());
+        processProductRows(rows, log.getSupplier(), log.getFileName(), autoOfferByKey);
         ObjectMapper mapper = new ObjectMapper();
         log.setPreviousStateJson(mapper.writeValueAsString(snapshot));
         log.setAppliedAt(LocalDateTime.now());
@@ -191,6 +204,8 @@ public class ImportService {
                         String skuTruncated = truncate(sku, 255);
                         productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
                             try {
+                                Product full = productRepository.findByIdWithAssociations(p.getId()).orElse(p);
+                                if (isManualLocked(full)) return;
                                 int added = icecatService.syncImagesForProduct(p.getId());
                                 if (added > 0) {
                                     ImportService.log.info("Import catalogo: Icecat ha aggiunto {} immagini per prodotto {} (SKU: {})", added, p.getId(), skuTruncated);
@@ -240,17 +255,19 @@ public class ImportService {
             String skuTruncated = truncate(sku, 255);
             ProductSnapshotDTO snap = snapshot.get(skuTruncated);
             if (snap != null) {
-                restoreFromSnapshot(snap);
+                restoreFromSnapshot(snap, log, mapper);
             } else {
                 productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
                     // Nessuno snapshot: significa prodotto creato dall'import nel "catalogo virtuale".
                     // Però se l'utente ha creato manualmente lo stesso SKU, lo preserviamo.
-                    boolean isManualNew =
-                            Boolean.TRUE.equals(p.getNuovoManuale())
-                                    || (p.getCategoria() != null
-                                    && p.getCategoria().getNome() != null
-                                    && "Nuovi prodotti".equalsIgnoreCase(p.getCategoria().getNome()));
+                    boolean isManualNew = Boolean.TRUE.equals(p.getNuovoManuale());
                     if (isManualNew) return;
+
+                    // Se l'utente ha comunque salvato immagini manuali sul prodotto,
+                    // non lo eliminiamo durante il rollback dell'import.
+                    Product full = productRepository.findByIdWithAssociations(p.getId()).orElse(p);
+                    if (hasManualImages(full)) return;
+
                     productService.deleteById(p.getId());
                 });
             }
@@ -269,7 +286,9 @@ public class ImportService {
         dto.setNome(p.getNome());
         dto.setDescrizione(p.getDescrizione());
         dto.setPrezzoBase(p.getPrezzoBase());
+        dto.setPrezzoOfferta(p.getPrezzoOfferta());
         dto.setPrezzoFinale(p.getPrezzoFinale());
+        dto.setInOfferta(p.getInOfferta());
         dto.setAumentoPercentuale(p.getAumentoPercentuale());
         dto.setCategoriaId(p.getCategoria() != null ? p.getCategoria().getId() : null);
         dto.setSupplierId(p.getFornitore() != null ? p.getFornitore().getId() : null);
@@ -278,14 +297,24 @@ public class ImportService {
         return dto;
     }
 
-    private void restoreFromSnapshot(ProductSnapshotDTO snap) {
+    private void restoreFromSnapshot(ProductSnapshotDTO snap, ImportLog importLog, ObjectMapper mapper) {
         Product product = productRepository.findById(snap.getId()).orElse(null);
         if (product == null) return;
+
         product.setEan(snap.getEan());
         product.setNome(snap.getNome());
-        product.setDescrizione(snap.getDescrizione());
+
+        // Descrizione: la ripristiniamo dallo snapshot solo se l'utente NON l'ha modificata manualmente
+        // dopo l'ora in cui l'import è stato applicato.
+        boolean descrizioneEditedAfterImport = hasDescrizioneChangedAfterImport(product.getId(), importLog, product, mapper);
+        if (!descrizioneEditedAfterImport) {
+            product.setDescrizione(snap.getDescrizione());
+        }
+
         product.setPrezzoBase(snap.getPrezzoBase());
+        product.setPrezzoOfferta(snap.getPrezzoOfferta());
         product.setPrezzoFinale(snap.getPrezzoFinale());
+        product.setInOfferta(Boolean.TRUE.equals(snap.getInOfferta()));
         product.setAumentoPercentuale(snap.getAumentoPercentuale());
         product.setContati(snap.getContati());
         product.setDisponibilita(snap.getDisponibilita());
@@ -300,6 +329,82 @@ public class ImportService {
             product.setFornitore(null);
         }
         productService.save(product);
+    }
+
+    private boolean hasDescrizioneChangedAfterImport(Long productId, ImportLog importLog, Product currentProduct, ObjectMapper mapper) {
+        if (importLog == null || importLog.getAppliedAt() == null) return false;
+        if (productId == null) return false;
+
+        LocalDateTime appliedAt = importLog.getAppliedAt();
+
+        // Le revisioni sono ordinate decrescente per createdAt, quindi interrompiamo quando arriviamo al limite.
+        List<ProductRevision> revisions = productRevisionRepository.findByProductIdOrderByCreatedAtDesc(
+                productId, PageRequest.of(0, 50));
+
+        for (ProductRevision rev : revisions) {
+            if (rev == null || rev.getCreatedAt() == null) continue;
+            if (!rev.getCreatedAt().isAfter(appliedAt)) {
+                // questa e tutte le successive (più vecchie) non sono dopo l'import
+                break;
+            }
+            try {
+                if (rev.getSnapshotJson() == null) return true;
+                ProductRevisionDTO revSnap = mapper.readValue(rev.getSnapshotJson(), ProductRevisionDTO.class);
+                // Se la descrizione attuale NON coincide con quella "prima dell'update" salvata nella revisione,
+                // significa che la descrizione è cambiata a valle dell'import.
+                if (!Objects.equals(currentProduct.getDescrizione(), revSnap.getDescrizione())) {
+                    return true;
+                }
+            } catch (Exception e) {
+                // Se non possiamo interpretare la revisione, preferiamo preservare la descrizione corrente.
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean hasManualImages(Product product) {
+        if (product == null || product.getDocumenti() == null) return false;
+        return product.getDocumenti().stream().anyMatch(d -> {
+            if (d == null) return false;
+            if (d.getTipo() != null && "immagine_manual".equalsIgnoreCase(d.getTipo())) return true;
+            String url = d.getUrl();
+            return url != null && url.contains("/manual_");
+        });
+    }
+
+    /**
+     * Prodotto bloccato da modifiche import automatiche:
+     * - ha immagini manuali, oppure
+     * - ha almeno una revisione (modifica manuale salvata dall'utente).
+     */
+    private boolean isManualLocked(Product product) {
+        if (product == null || product.getId() == null) return false;
+        if (hasManualImages(product)) return true;
+        return productRevisionRepository.existsByProductId(product.getId());
+    }
+
+    /**
+     * Se esiste un prodotto soft-deleted con stesso SKU/EAN, lo riattiva e lo riusa.
+     * Evita violazioni di unique(sku) quando si re-importa un articolo precedentemente soft-deleted.
+     */
+    private Optional<Product> reviveSoftDeletedProduct(String sku, String ean) {
+        Optional<Product> bySku = sku != null ? productRepository.findBySkuIncludingDeleted(sku) : Optional.empty();
+        if (bySku.isPresent() && Boolean.TRUE.equals(bySku.get().getDeleted())) {
+            Product p = bySku.get();
+            p.setDeleted(false);
+            p.setDeletedAt(null);
+            return Optional.of(productRepository.save(p));
+        }
+        Optional<Product> byEan = ean != null ? productRepository.findByEanIncludingDeleted(ean) : Optional.empty();
+        if (byEan.isPresent() && Boolean.TRUE.equals(byEan.get().getDeleted())) {
+            Product p = byEan.get();
+            p.setDeleted(false);
+            p.setDeletedAt(null);
+            return Optional.of(productRepository.save(p));
+        }
+        return Optional.empty();
     }
 
     private List<ProductImportDTO> parseProductRowsFromBytes(byte[] bytes, String filename, String contentType) throws Exception {
@@ -338,13 +443,16 @@ public class ImportService {
                 .or(() -> categoryRepository.findByNomeIgnoreCase(canonicalName));
     }
 
-    private void processProductRows(List<ProductImportDTO> rows, Supplier supplier, String filename) throws Exception {
+    private void processProductRows(List<ProductImportDTO> rows, Supplier supplier, String filename, Map<String, Boolean> autoOfferByKey) throws Exception {
         Optional<Category> categoryFromFilename = resolveCategoryFromFilename(filename);
+        boolean promotionImport = isPromotionFileName(filename);
         for (ProductImportDTO dto : rows) {
             checkCancelled();
             String sku = normalize(dto.getSku());
             if (sku == null) continue;
             sku = truncate(sku, 255);
+            final String skuFinal = sku;
+            final String eanFinal = normalize(dto.getEan());
             String nomeProdotto = normalize(dto.getNome());
             if (nomeProdotto == null) nomeProdotto = sku;
             nomeProdotto = truncate(nomeProdotto, 255);
@@ -368,19 +476,86 @@ public class ImportService {
                             return categoryRepository.save(c);
                         });
             }
-            Product product = productMatchingService.findProductBySkuOnly(sku).getProduct().orElseGet(Product::new);
-            product.setSku(sku);
-            product.setNome(nomeProdotto);
-            product.setPrezzoBase(dto.getPrezzoBase() != null ? BigDecimal.valueOf(dto.getPrezzoBase()) : BigDecimal.ZERO);
-            product.setCategoria(category);
-            product.setFornitore(supplier);
+            Product product = productMatchingService.findProductBySkuOnly(skuFinal).getProduct()
+                    .or(() -> reviveSoftDeletedProduct(skuFinal, eanFinal))
+                    .orElseGet(Product::new);
+            boolean isNewProduct = product.getId() == null;
+            if (!isNewProduct) {
+                // Ricarica il prodotto completo (con associazioni) per valutare eventuali blocchi manuali.
+                product = productRepository.findByIdWithAssociations(product.getId()).orElse(product);
+            }
+            String originalDescrizione = isNewProduct ? null : product.getDescrizione();
+            Long originalCategoriaId = (!isNewProduct && product.getCategoria() != null) ? product.getCategoria().getId() : null;
+
+            // Sempre: manteniamo SKU coerente
+            product.setSku(skuFinal);
+
+            if (isNewProduct) {
+                // Per i prodotti nuovi importiamo tutti i dati dal CSV
+                product.setNome(nomeProdotto);
+                BigDecimal importedPrice = dto.getPrezzoBase() != null ? BigDecimal.valueOf(dto.getPrezzoBase()) : null;
+                if (promotionImport) {
+                    // Per i nuovi prodotti in un CSV "offerte" usiamo il confronto (prezzo corrente < import precedente)
+                    // e NON includiamo a prescindere quelli col prezzo più alto.
+                    product.setPrezzoOfferta(importedPrice);
+                    Boolean autoOffer = resolveAutoOfferFlag(autoOfferByKey, dto, skuFinal, eanFinal, nomeProdotto);
+                    boolean inOffer = Boolean.TRUE.equals(autoOffer);
+                    product.setInOfferta(inOffer);
+                    if (!inOffer) {
+                        product.setPrezzoOfferta(null);
+                    }
+                } else {
+                    product.setPrezzoBase(importedPrice != null ? importedPrice : BigDecimal.ZERO);
+                }
+
+                // Categoria: assegna quella dell'import solo per prodotti nuovi o senza categoria.
+                if (!promotionImport && product.getCategoria() == null) {
+                    product.setCategoria(category);
+                }
+
+                product.setFornitore(supplier);
+                String eanVal = normalize(dto.getEan());
+                product.setEan(eanVal != null ? truncate(eanVal, 32) : skuFinal);
+                product.setMarca(truncate(normalize(dto.getMarca()), 128));
+                product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
+                String descrizioneVal = normalize(dto.getDescrizione());
+                if (descrizioneVal != null && !descrizioneVal.isBlank()) {
+                    product.setDescrizione(descrizioneVal);
+                }
+            } else {
+                // Prodotto già esistente: dal CSV aggiorniamo solo disponibilità CS e prezzo base.
+                // Tutti gli altri campi (nome, categoria, descrizione, marca, codiceProduttore, fornitore, ecc.)
+                // restano come nel database.
+                if (dto.getPrezzoBase() != null) {
+                    BigDecimal importedPrice = BigDecimal.valueOf(dto.getPrezzoBase());
+                    if (promotionImport) {
+                        // Import promozionale: in offerta solo se prezzo promo < prezzo base attuale.
+                        applyPromotionPrice(product, importedPrice, false);
+                    } else {
+                        product.setPrezzoBase(importedPrice);
+                    }
+                }
+                // Assicuriamoci comunque di non perdere una descrizione già presente.
+                if (originalDescrizione != null && (product.getDescrizione() == null || product.getDescrizione().isBlank())) {
+                    product.setDescrizione(originalDescrizione);
+                }
+            }
+            // In ogni caso aggiorniamo la disponibilità CS dal CSV.
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
-            String eanVal = normalize(dto.getEan());
-            product.setEan(eanVal != null ? truncate(eanVal, 32) : sku);
-            product.setMarca(truncate(normalize(dto.getMarca()), 128));
-            product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
-            String descrizioneVal = normalize(dto.getDescrizione());
-            product.setDescrizione(descrizioneVal != null && !descrizioneVal.isBlank() ? descrizioneVal : null);
+            if (!promotionImport) {
+                Boolean autoOffer = resolveAutoOfferFlag(autoOfferByKey, dto, skuFinal, eanFinal, nomeProdotto);
+                if (autoOffer != null) {
+                    product.setInOfferta(Boolean.TRUE.equals(autoOffer));
+                }
+            }
+            // Hard guard: su prodotto esistente NON cambiare categoria durante import.
+            if (!isNewProduct) {
+                if (originalCategoriaId != null) {
+                    categoryRepository.findById(originalCategoriaId).ifPresent(product::setCategoria);
+                } else {
+                    product.setCategoria(null);
+                }
+            }
             productService.save(product);
         }
     }
@@ -414,10 +589,12 @@ public class ImportService {
 
         // Se il nome del file (senza estensione) coincide con una categoria, tutti i prodotti vanno in quella categoria
         Optional<Category> categoryFromFilename = resolveCategoryFromFilename(originalFilename);
+        boolean promotionImport = isPromotionFileName(originalFilename);
         if (categoryFromFilename.isPresent()) {
             log.info("Import prodotti: categoria forzata dal nome file '{}' -> tutti i prodotti in categoria '{}'",
                     originalFilename, categoryFromFilename.get().getNome());
         }
+        Map<String, Boolean> autoOfferByKey = computeAutoOfferFlagsForSupplier(supplierId, null, rows);
 
         int rowNumber = 1; // 1-based rispetto alle righe dati (escluso header)
         for (ProductImportDTO dto : rows) {
@@ -478,32 +655,92 @@ public class ImportService {
             }
 
             // Match: se codice era EAN, cerca per EAN; altrimenti per SKU
+            final String skuFinal = sku;
+            final String eanFinal = ean;
             Product product = (isCodiceEan
                     ? productMatchingService.findProduct(null, ean)
                     : productMatchingService.findProductBySku(sku))
                     .getProduct()
+                    .or(() -> reviveSoftDeletedProduct(skuFinal, eanFinal))
                     .orElseGet(Product::new);
+            boolean isNewProduct = product.getId() == null;
+            if (!isNewProduct) {
+                // Ricarica il prodotto completo dal repository per avere categoria, immagini e dati manuali aggiornati.
+                product = productRepository.findByIdWithAssociations(product.getId()).orElse(product);
+            }
+            String originalDescrizione = isNewProduct ? null : product.getDescrizione();
+            Long originalCategoriaId = (!isNewProduct && product.getCategoria() != null) ? product.getCategoria().getId() : null;
+
+            // Sempre: manteniamo identificatori coerenti
             product.setSku(sku);
             product.setEan(ean);
-            product.setNome(nomeProdotto);
 
-            if (dto.getPrezzoBase() != null) {
-                product.setPrezzoBase(BigDecimal.valueOf(dto.getPrezzoBase()));
+            if (isNewProduct) {
+                // Prodotto nuovo: importiamo tutti i dati dal CSV
+                product.setNome(nomeProdotto);
+                BigDecimal importedPrice = dto.getPrezzoBase() != null
+                        ? BigDecimal.valueOf(dto.getPrezzoBase())
+                        : null;
+                if (promotionImport) {
+                    product.setPrezzoOfferta(importedPrice);
+                    Boolean autoOffer = resolveAutoOfferFlag(autoOfferByKey, dto, sku, ean, nomeProdotto);
+                    boolean inOffer = Boolean.TRUE.equals(autoOffer);
+                    product.setInOfferta(inOffer);
+                    if (!inOffer) {
+                        product.setPrezzoOfferta(null);
+                    }
+                } else {
+                    product.setPrezzoBase(importedPrice != null ? importedPrice : BigDecimal.ZERO);
+                }
+
+                // Categoria solo se non presente (nuovo o senza categoria)
+                if (!promotionImport && product.getCategoria() == null) {
+                    product.setCategoria(category);
+                }
+
+                if (supplier != null) {
+                    product.setFornitore(supplier);
+                }
+
+                product.setMarca(truncate(normalize(dto.getMarca()), 128));
+                product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
+                String descrizioneVal = normalize(dto.getDescrizione());
+                if (descrizioneVal != null && !descrizioneVal.isBlank()) {
+                    product.setDescrizione(descrizioneVal);
+                }
             } else {
-                product.setPrezzoBase(BigDecimal.ZERO);
+                // Prodotto esistente: non tocchiamo nome, categoria, descrizione, marca, ecc.
+                // Dal CSV aggiorniamo solo disponibilità CS e prezzo base.
+                if (dto.getPrezzoBase() != null) {
+                    BigDecimal importedPrice = BigDecimal.valueOf(dto.getPrezzoBase());
+                    if (promotionImport) {
+                        applyPromotionPrice(product, importedPrice, false);
+                    } else {
+                        product.setPrezzoBase(importedPrice);
+                    }
+                }
+                // Se esisteva già una descrizione, assicuriamoci di non perderla.
+                if (originalDescrizione != null && (product.getDescrizione() == null || product.getDescrizione().isBlank())) {
+                    product.setDescrizione(originalDescrizione);
+                }
             }
 
-            product.setCategoria(category);
-
-            if (supplier != null) {
-                product.setFornitore(supplier);
-            }
-
+            // Aggiorna sempre la disponibilità CS dal CSV.
             product.setDisponibilita(truncate(normalize(dto.getDisponibilita()), 64));
-            product.setMarca(truncate(normalize(dto.getMarca()), 128));
-            product.setCodiceProduttore(truncate(normalize(dto.getCodiceProduttore()), 64));
-            String descrizioneVal = normalize(dto.getDescrizione());
-            product.setDescrizione(descrizioneVal != null && !descrizioneVal.isBlank() ? descrizioneVal : null);
+            if (!promotionImport) {
+                Boolean autoOffer = resolveAutoOfferFlag(autoOfferByKey, dto, sku, ean, nomeProdotto);
+                if (autoOffer != null) {
+                    product.setInOfferta(Boolean.TRUE.equals(autoOffer));
+                }
+            }
+            // Hard guard: su prodotto esistente NON cambiare categoria durante import.
+            if (!isNewProduct) {
+                if (originalCategoriaId != null) {
+                    categoryRepository.findById(originalCategoriaId).ifPresent(product::setCategoria);
+                } else {
+                    product.setCategoria(null);
+                }
+            }
 
             productService.save(product);
             rowNumber++;
@@ -527,6 +764,40 @@ public class ImportService {
             log.setFileContentType(contentType);
             log.setImportedAt(LocalDateTime.now());
             importLogRepository.save(log);
+        }
+
+        // Dopo ogni import nel catalogo virtuale, lancia (opzionale) la sync Icecat
+        // per aggiornare immagini/descrizioni dei prodotti interessati.
+        if (syncIcecatAfterApply) {
+            List<ProductImportDTO> rowsForSync = rows;
+            CompletableFuture.runAsync(() -> {
+                try {
+                    for (ProductImportDTO dto : rowsForSync) {
+                        if (cancelRequested.get() || Thread.currentThread().isInterrupted()) {
+                            throw new CancellationException("Sync Icecat annullata dall'utente.");
+                        }
+                        String sku = normalize(dto.getSku());
+                        if (sku == null) continue;
+                        String skuTruncated = truncate(sku, 255);
+                        productMatchingService.findProductBySkuOnly(skuTruncated).getProduct().ifPresent(p -> {
+                            try {
+                                Product full = productRepository.findByIdWithAssociations(p.getId()).orElse(p);
+                                if (isManualLocked(full)) return;
+                                int added = icecatService.syncImagesForProduct(p.getId());
+                                if (added > 0) {
+                                    ImportService.log.info("Import catalogo (virtuale): Icecat ha aggiunto {} immagini per prodotto {} (SKU: {})", added, p.getId(), skuTruncated);
+                                }
+                            } catch (Exception e) {
+                                ImportService.log.warn("Import catalogo (virtuale): sync Icecat fallito per prodotto {} (SKU: {}): {}", p.getId(), skuTruncated, e.getMessage());
+                            }
+                        });
+                    }
+                } catch (CancellationException ce) {
+                    ImportService.log.info("Import catalogo (virtuale): sync Icecat interrotta: {}", ce.getMessage());
+                } catch (Exception e) {
+                    ImportService.log.warn("Import catalogo (virtuale): sync Icecat background fallita: {}", e.getMessage());
+                }
+            });
         }
 
         log.info("Import prodotti completato: file='{}', salvati={} righe, supplierId={}",
@@ -619,7 +890,7 @@ public class ImportService {
             csv = normalizeHeaderLine(csv, separator);
 
             try (CSVReader csvReader = new CSVReaderBuilder(new StringReader(csv))
-                    .withCSVParser(new CSVParserBuilder().withSeparator(separator).build())
+                    .withCSVParser(buildCsvParser(separator))
                     .build()) {
                 return new CsvToBeanBuilder<T>(csvReader)
                         .withType(type)
@@ -655,10 +926,13 @@ public class ImportService {
             }
 
             char separator = detectSeparator(csv);
+            if (separator == '|' && ProductImportDTO.class.equals(type)) {
+                csv = prependSyntheticPipeProductHeaderIfNeeded(csv);
+            }
             csv = normalizeHeaderLine(csv, separator);
 
             try (CSVReader csvReader = new CSVReaderBuilder(new StringReader(csv))
-                    .withCSVParser(new CSVParserBuilder().withSeparator(separator).build())
+                    .withCSVParser(buildCsvParser(separator))
                     .build()) {
                 return new CsvToBeanBuilder<T>(csvReader)
                         .withType(type)
@@ -680,6 +954,16 @@ public class ImportService {
                     e
             );
         }
+    }
+
+    private com.opencsv.CSVParser buildCsvParser(char separator) {
+        CSVParserBuilder builder = new CSVParserBuilder().withSeparator(separator);
+        // Alcuni listini pipe-delimited contengono apici doppi non escapati (es. 10", 65")
+        // che rompono il parser standard CSV. In modalità pipe, disabilitiamo il quote parsing.
+        if (separator == '|') {
+            builder = builder.withQuoteChar('\0');
+        }
+        return builder.build();
     }
 
     private String stripBom(String s) {
@@ -726,6 +1010,81 @@ public class ImportService {
             if (s.charAt(i) == c) count++;
         }
         return count;
+    }
+
+    /**
+     * Listini pipe-delimited senza riga header: la prima riga è già un prodotto (codice|categoria|marca|nome|prezzo|...).
+     * Senza questa patch la prima riga viene trattata come intestazione e sku/nome/prezzo restano sempre null → righe saltate.
+     */
+    private String prependSyntheticPipeProductHeaderIfNeeded(String csv) {
+        String[] split = csv.split("\\R", 2);
+        String firstLine = split[0];
+        String rest = split.length > 1 ? split[1] : "";
+        if (firstLine == null || firstLine.isBlank()) {
+            return csv;
+        }
+        if (csvFirstLineLooksLikeProductHeader(firstLine, '|')) {
+            return csv;
+        }
+        String[] cols = firstLine.split(Pattern.quote("|"), -1);
+        int n = cols.length;
+        if (n < 5) {
+            return csv;
+        }
+        String headerRow = buildSyntheticPipeProductHeaderRow(n);
+        log.info("Import prodotti: CSV pipe senza header standard — aggiunta intestazione sintetica ({} colonne).", n);
+        if (rest.isEmpty()) {
+            return headerRow + "\n" + firstLine;
+        }
+        return headerRow + "\n" + firstLine + "\n" + rest;
+    }
+
+    private String buildSyntheticPipeProductHeaderRow(int colCount) {
+        String[] h = new String[colCount];
+        h[0] = "sku";
+        h[1] = "categoria";
+        h[2] = "marca";
+        h[3] = "nome_prodotto";
+        h[4] = "prezzo";
+        for (int i = 5; i < colCount; i++) {
+            if (i == 7) {
+                h[i] = "disponibilita";
+            } else if (colCount >= 10 && i == colCount - 2) {
+                h[i] = "codice_produttore";
+            } else if (colCount >= 10 && i == colCount - 1) {
+                h[i] = "__ignored_end";
+            } else {
+                h[i] = "__ignored_" + i;
+            }
+        }
+        return String.join("|", h);
+    }
+
+    /**
+     * True se almeno una colonna della prima riga, dopo alias, corrisponde a campi attesi dall'import prodotti.
+     */
+    private boolean csvFirstLineLooksLikeProductHeader(String firstLine, char sep) {
+        String[] cols = firstLine.split(Pattern.quote(String.valueOf(sep)), -1);
+        for (String raw : cols) {
+            String col = normalizeHeaderCellForAlias(raw);
+            String mapped = aliasHeader(col);
+            if ("sku".equals(mapped) || "ean".equals(mapped) || "nome_prodotto".equals(mapped)
+                    || "categoria".equals(mapped) || "prezzo".equals(mapped)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String normalizeHeaderCellForAlias(String col) {
+        if (col == null) return "";
+        col = stripBom(col).trim();
+        if (col.startsWith("\"") && col.endsWith("\"") && col.length() >= 2) {
+            col = col.substring(1, col.length() - 1);
+        }
+        col = col.trim().toLowerCase(Locale.ROOT);
+        col = col.replaceAll("\\s+", "_");
+        return col;
     }
 
     private String normalizeHeaderLine(String csv, char separator) {
@@ -858,6 +1217,38 @@ public class ImportService {
             return value;
         }
         return value.substring(0, maxLength);
+    }
+
+    private boolean isPromotionFileName(String filename) {
+        if (filename == null || filename.isBlank()) return false;
+        String lower = filename.toLowerCase(Locale.ROOT);
+        return lower.contains("promo")
+                || lower.contains("promoz")
+                || lower.contains("offert")
+                || lower.contains("offer");
+    }
+
+    /**
+     * Regola import promozionale:
+     * - prodotto esistente: entra in offerta solo se prezzo promo < prezzo base corrente;
+     * - prodotto nuovo: la marcatura in offerta dipende dal confronto (vedi chiamanti);
+     */
+    private void applyPromotionPrice(Product product, BigDecimal importedPrice, boolean isNewProduct) {
+        if (product == null || importedPrice == null) return;
+        if (isNewProduct) {
+            // Decisione su `inOfferta` demandata al chiamante (serve confronto esterno).
+            product.setPrezzoOfferta(importedPrice);
+            product.setInOfferta(false);
+            return;
+        }
+        BigDecimal base = product.getPrezzoBase();
+        if (base != null && importedPrice.compareTo(base) < 0) {
+            product.setPrezzoOfferta(importedPrice);
+            product.setInOfferta(true);
+        } else {
+            product.setPrezzoOfferta(null);
+            product.setInOfferta(false);
+        }
     }
 
     private boolean isExcelFile(String originalFilename, String contentType) {
@@ -1461,6 +1852,438 @@ public class ImportService {
             }
         }
         return false;
+    }
+
+    private Map<String, Boolean> computeAutoOfferFlagsFromPreviousImport(ImportLog currentImport, List<ProductImportDTO> currentRows) {
+        if (currentImport == null || currentImport.getSupplier() == null) return Map.of();
+        return computeAutoOfferFlagsForSupplier(
+                currentImport.getSupplier().getId(),
+                currentImport.getId(),
+                currentRows
+        );
+    }
+
+    private Map<String, Boolean> computeAutoOfferFlagsForSupplier(Long supplierId,
+                                                                   Long currentImportId,
+                                                                   List<ProductImportDTO> currentRows) {
+        if (supplierId == null || currentRows == null || currentRows.isEmpty()) return Map.of();
+        try {
+            List<ImportLog> previousImports = importLogRepository.findPreviousProductImportsForSupplier(
+                    supplierId,
+                    currentImportId != null ? currentImportId : -1L,
+                    PageRequest.of(0, 1)
+            );
+            if (previousImports.isEmpty()) return Map.of();
+            ImportLog prev = previousImports.get(0);
+            if (prev.getFileContent() == null || prev.getFileContent().length == 0) return Map.of();
+
+            List<ProductImportDTO> previousRows = parseProductRowsFromBytes(
+                    prev.getFileContent(),
+                    prev.getFileName(),
+                    prev.getFileContentType()
+            );
+            Map<String, Double> prevPriceByKey = new HashMap<>();
+            for (ProductImportDTO dto : previousRows) {
+                String key = offerComparisonKey(dto.getSku(), dto.getEan(), dto.getNome());
+                if (key == null || prevPriceByKey.containsKey(key) || dto.getPrezzoBase() == null) continue;
+                prevPriceByKey.put(key, dto.getPrezzoBase());
+            }
+
+            Map<String, Boolean> out = new HashMap<>();
+            for (ProductImportDTO dto : currentRows) {
+                String key = offerComparisonKey(dto.getSku(), dto.getEan(), dto.getNome());
+                if (key == null || dto.getPrezzoBase() == null) continue;
+                Double prevPrice = prevPriceByKey.get(key);
+                if (prevPrice == null) continue;
+                out.put(key, dto.getPrezzoBase() < prevPrice);
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("Auto-offerte: impossibile calcolare confronto con import precedente (supplierId={}): {}",
+                    supplierId, e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private String offerComparisonKey(String sku, String ean, String nome) {
+        String s = normalize(sku);
+        if (s != null) return "SKU:" + truncate(s, 255);
+        String e = normalize(ean);
+        if (e != null) return "EAN:" + truncate(e, 255);
+        String n = normalize(nome);
+        if (n != null) return "NOME:" + truncate(n, 255);
+        return null;
+    }
+
+    private Boolean resolveAutoOfferFlag(Map<String, Boolean> autoOfferByKey,
+                                         ProductImportDTO dto,
+                                         String normalizedSku,
+                                         String normalizedEan,
+                                         String normalizedNome) {
+        if (autoOfferByKey == null || autoOfferByKey.isEmpty()) return null;
+        String[] keys = new String[] {
+                offerComparisonKey(dto != null ? dto.getSku() : null, dto != null ? dto.getEan() : null, dto != null ? dto.getNome() : null),
+                offerComparisonKey(normalizedSku, null, null),
+                offerComparisonKey(null, normalizedEan, null),
+                offerComparisonKey(null, null, normalizedNome)
+        };
+        for (String key : keys) {
+            if (key != null && autoOfferByKey.containsKey(key)) {
+                return autoOfferByKey.get(key);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Confronta due file import PRODOTTI dello stesso fornitore.
+     * Utile per decidere se applicare import automatico o gestire manualmente (es. poche offerte).
+     */
+    public Map<String, Object> compareProductImportLogs(ImportLog left, ImportLog right) throws Exception {
+        if (left == null || right == null) {
+            throw new IllegalArgumentException("Import non validi per il confronto.");
+        }
+        if (left.getFileContent() == null || left.getFileContent().length == 0
+                || right.getFileContent() == null || right.getFileContent().length == 0) {
+            throw new IllegalArgumentException("Uno dei due CSV è vuoto o non disponibile.");
+        }
+
+        List<ProductImportDTO> leftRows = parseProductRowsFromBytes(left.getFileContent(), left.getFileName(), left.getFileContentType());
+        List<ProductImportDTO> rightRows = parseProductRowsFromBytes(right.getFileContent(), right.getFileName(), right.getFileContentType());
+
+        Map<String, ProductImportDTO> leftByKey = new HashMap<>();
+        Map<String, ProductImportDTO> rightByKey = new HashMap<>();
+        Map<String, ProductImportDTO> rightBySku = new HashMap<>();
+        Map<String, ProductImportDTO> rightByEan = new HashMap<>();
+        Map<String, ProductImportDTO> rightByNome = new HashMap<>();
+        Set<String> leftOffer = new HashSet<>();
+        Set<String> rightOffer = new HashSet<>();
+
+        for (ProductImportDTO dto : leftRows) {
+            String key = importRowKey(dto);
+            if (key == null || leftByKey.containsKey(key)) continue;
+            leftByKey.put(key, dto);
+            if (isOfferRow(dto)) leftOffer.add(key);
+        }
+        for (ProductImportDTO dto : rightRows) {
+            String key = importRowKey(dto);
+            if (key == null || rightByKey.containsKey(key)) continue;
+            rightByKey.put(key, dto);
+            if (isOfferRow(dto)) rightOffer.add(key);
+            String sku = normalize(dto.getSku());
+            String ean = normalize(dto.getEan());
+            String nome = normalize(dto.getNome());
+            if (sku != null) rightBySku.putIfAbsent(sku, dto);
+            if (ean != null) rightByEan.putIfAbsent(ean, dto);
+            if (nome != null) rightByNome.putIfAbsent(nome, dto);
+        }
+
+        int onlyLeft = 0;
+        int onlyRight = 0;
+        int unchanged = 0;
+        int priceChanged = 0;
+        int availabilityChanged = 0;
+        int offerChanged = 0;
+        List<String> newlyInOffer = new java.util.ArrayList<>();
+        List<Map<String, Object>> priceDifferences = new java.util.ArrayList<>();
+        Set<String> matchedRightKeys = new HashSet<>();
+        List<Map<String, Object>> missingInRight = new java.util.ArrayList<>();
+        List<Map<String, Object>> missingInLeft = new java.util.ArrayList<>();
+
+        for (String key : leftByKey.keySet()) {
+            ProductImportDTO l = leftByKey.get(key);
+            MatchResult match = findMatchingRow(l, rightByKey, rightBySku, rightByEan, rightByNome, matchedRightKeys);
+            ProductImportDTO r = match.row;
+            if (r == null) {
+                onlyLeft++;
+                missingInRight.add(buildMissingRow(l, "Presente solo in CSV A"));
+                continue;
+            }
+            matchedRightKeys.add(importRowKey(r));
+            boolean samePrice = Objects.equals(normalizePrice(l.getPrezzoBase()), normalizePrice(r.getPrezzoBase()));
+            boolean sameDisp = Objects.equals(normalize(l.getDisponibilita()), normalize(r.getDisponibilita()));
+            String matchedKey = importRowKey(r);
+            boolean lOffer = leftOffer.contains(key);
+            boolean rOffer = matchedKey != null && rightOffer.contains(matchedKey);
+            if (!samePrice) {
+                priceChanged++;
+                priceDifferences.add(buildPriceDifferenceRow(l, r, match.by));
+            }
+            if (!sameDisp) availabilityChanged++;
+            if (lOffer != rOffer) {
+                offerChanged++;
+                if (!lOffer && rOffer) newlyInOffer.add(key);
+            }
+            if (samePrice && sameDisp && lOffer == rOffer) unchanged++;
+        }
+
+        for (String key : rightByKey.keySet()) {
+            if (!matchedRightKeys.contains(key)) {
+                onlyRight++;
+                ProductImportDTO rr = rightByKey.get(key);
+                if (rr != null) {
+                    missingInLeft.add(buildMissingRow(rr, "Presente solo in CSV B"));
+                }
+            }
+        }
+
+        String recommendation;
+        boolean anyDifference = onlyLeft > 0 || onlyRight > 0 || priceChanged > 0 || availabilityChanged > 0 || offerChanged > 0;
+        if (!anyDifference) {
+            recommendation = "I due listini sono identici.";
+        } else if (newlyInOffer.isEmpty()) {
+            recommendation = "Nessuna nuova offerta trovata, ma i listini NON sono uguali (ci sono variazioni di prezzo/disponibilità o articoli mancanti).";
+        } else if (newlyInOffer.size() == 1) {
+            recommendation = "Trovato 1 solo articolo nuovo in offerta: valuta caricamento manuale.";
+        } else {
+            recommendation = "Più articoli nuovi in offerta: puoi valutare import automatico.";
+        }
+
+        Map<String, Object> out = new HashMap<>();
+        out.put("leftImportId", left.getId());
+        out.put("rightImportId", right.getId());
+        out.put("leftFileName", left.getFileName());
+        out.put("rightFileName", right.getFileName());
+        out.put("leftRows", leftByKey.size());
+        out.put("rightRows", rightByKey.size());
+        out.put("unchanged", unchanged);
+        out.put("onlyLeft", onlyLeft);
+        out.put("onlyRight", onlyRight);
+        out.put("priceChanged", priceChanged);
+        out.put("availabilityChanged", availabilityChanged);
+        out.put("offerChanged", offerChanged);
+        out.put("newlyInOfferCount", newlyInOffer.size());
+        out.put("newlyInOfferKeys", newlyInOffer);
+        out.put("priceDifferences", priceDifferences);
+        out.put("missingInRight", missingInRight);
+        out.put("missingInLeft", missingInLeft);
+        out.put("recommendation", recommendation);
+        return out;
+    }
+
+    /**
+     * Confronta un CSV importato con lo stato attuale del database prodotti.
+     * Match per priorità: SKU -> EAN -> NOME.
+     */
+    public Map<String, Object> compareImportLogWithDatabase(ImportLog csvImport) throws Exception {
+        if (csvImport == null || csvImport.getFileContent() == null || csvImport.getFileContent().length == 0) {
+            throw new IllegalArgumentException("CSV non valido o vuoto.");
+        }
+        List<ProductImportDTO> csvRows = parseProductRowsFromBytes(
+                csvImport.getFileContent(),
+                csvImport.getFileName(),
+                csvImport.getFileContentType()
+        );
+        List<Product> dbProducts = productRepository.findAllWithAssociations();
+
+        Map<String, ProductImportDTO> csvByKey = new HashMap<>();
+        for (ProductImportDTO dto : csvRows) {
+            String key = importRowKey(dto);
+            if (key == null || csvByKey.containsKey(key)) continue;
+            csvByKey.put(key, dto);
+        }
+
+        Map<String, Product> dbBySku = new HashMap<>();
+        Map<String, Product> dbByEan = new HashMap<>();
+        Map<String, Product> dbByNome = new HashMap<>();
+        for (Product p : dbProducts) {
+            String sku = normalize(p.getSku());
+            String ean = normalize(p.getEan());
+            String nome = normalize(p.getNome());
+            if (sku != null) dbBySku.putIfAbsent(sku, p);
+            if (ean != null) dbByEan.putIfAbsent(ean, p);
+            if (nome != null) dbByNome.putIfAbsent(nome, p);
+        }
+
+        int unchanged = 0;
+        int priceChanged = 0;
+        int availabilityChanged = 0;
+        int onlyCsv = 0;
+        int onlyDb;
+        List<Map<String, Object>> priceDifferences = new java.util.ArrayList<>();
+        List<Map<String, Object>> missingInRight = new java.util.ArrayList<>(); // solo CSV
+        Set<Long> matchedDbIds = new HashSet<>();
+
+        for (ProductImportDTO left : csvByKey.values()) {
+            Product right = findDatabaseMatch(left, dbBySku, dbByEan, dbByNome, matchedDbIds);
+            if (right == null) {
+                onlyCsv++;
+                missingInRight.add(buildMissingRow(left, "Presente solo nel CSV"));
+                continue;
+            }
+            matchedDbIds.add(right.getId());
+
+            boolean samePrice = Objects.equals(normalizePrice(left.getPrezzoBase()), normalizePrice(toDouble(right.getPrezzoBase())));
+            boolean sameDisp = Objects.equals(normalize(left.getDisponibilita()), normalize(right.getDisponibilita()));
+            if (!samePrice) {
+                priceChanged++;
+                priceDifferences.add(buildPriceDifferenceRowCsvVsDb(left, right));
+            }
+            if (!sameDisp) {
+                availabilityChanged++;
+            }
+            if (samePrice && sameDisp) {
+                unchanged++;
+            }
+        }
+
+        onlyDb = Math.max(0, dbProducts.size() - matchedDbIds.size());
+
+        String recommendation = priceChanged == 0 && onlyCsv == 0
+                ? "CSV allineato al database per prezzi e prodotti."
+                : "Trovate differenze tra CSV e database: verifica la lista dettagliata.";
+
+        Map<String, Object> out = new HashMap<>();
+        out.put("leftImportId", csvImport.getId());
+        out.put("leftFileName", csvImport.getFileName());
+        out.put("rightFileName", "Database");
+        out.put("leftRows", csvByKey.size());
+        out.put("rightRows", dbProducts.size());
+        out.put("unchanged", unchanged);
+        out.put("onlyLeft", onlyCsv);
+        out.put("onlyRight", onlyDb);
+        out.put("priceChanged", priceChanged);
+        out.put("availabilityChanged", availabilityChanged);
+        out.put("offerChanged", 0);
+        out.put("newlyInOfferCount", 0);
+        out.put("newlyInOfferKeys", List.of());
+        out.put("priceDifferences", priceDifferences);
+        out.put("missingInRight", missingInRight);
+        out.put("missingInLeft", List.of());
+        out.put("recommendation", recommendation);
+        return out;
+    }
+
+    private Product findDatabaseMatch(ProductImportDTO left,
+                                      Map<String, Product> dbBySku,
+                                      Map<String, Product> dbByEan,
+                                      Map<String, Product> dbByNome,
+                                      Set<Long> matchedDbIds) {
+        String sku = normalize(left.getSku());
+        if (sku != null) {
+            Product p = dbBySku.get(sku);
+            if (p != null && p.getId() != null && !matchedDbIds.contains(p.getId())) return p;
+        }
+        String ean = normalize(left.getEan());
+        if (ean != null) {
+            Product p = dbByEan.get(ean);
+            if (p != null && p.getId() != null && !matchedDbIds.contains(p.getId())) return p;
+        }
+        String nome = normalize(left.getNome());
+        if (nome != null) {
+            Product p = dbByNome.get(nome);
+            if (p != null && p.getId() != null && !matchedDbIds.contains(p.getId())) return p;
+        }
+        return null;
+    }
+
+    private Map<String, Object> buildPriceDifferenceRowCsvVsDb(ProductImportDTO csv, Product db) {
+        Map<String, Object> row = new HashMap<>();
+        Double oldPrice = csv.getPrezzoBase();
+        Double newPrice = toDouble(db.getPrezzoBase());
+        double delta = (newPrice != null ? newPrice : 0d) - (oldPrice != null ? oldPrice : 0d);
+        row.put("sku", normalize(csv.getSku()) != null ? csv.getSku() : db.getSku());
+        row.put("ean", normalize(csv.getEan()) != null ? csv.getEan() : db.getEan());
+        row.put("nome", normalize(csv.getNome()) != null ? csv.getNome() : db.getNome());
+        row.put("oldPrice", oldPrice);
+        row.put("newPrice", newPrice);
+        row.put("delta", delta);
+        row.put("direction", delta > 0 ? "AUMENTATO" : (delta < 0 ? "DIMINUITO" : "VARIATO"));
+        row.put("matchedBy", "CSV_vs_DB");
+        return row;
+    }
+
+    private Double toDouble(BigDecimal value) {
+        return value != null ? value.doubleValue() : null;
+    }
+
+    private static class MatchResult {
+        private final ProductImportDTO row;
+        private final String by;
+
+        private MatchResult(ProductImportDTO row, String by) {
+            this.row = row;
+            this.by = by;
+        }
+    }
+
+    private MatchResult findMatchingRow(ProductImportDTO left,
+                                        Map<String, ProductImportDTO> rightByKey,
+                                        Map<String, ProductImportDTO> rightBySku,
+                                        Map<String, ProductImportDTO> rightByEan,
+                                        Map<String, ProductImportDTO> rightByNome,
+                                        Set<String> alreadyMatchedRightKeys) {
+        String sku = normalize(left.getSku());
+        if (sku != null) {
+            ProductImportDTO r = rightBySku.get(sku);
+            String rk = importRowKey(r);
+            if (r != null && rk != null && !alreadyMatchedRightKeys.contains(rk)) return new MatchResult(r, "SKU");
+        }
+        String ean = normalize(left.getEan());
+        if (ean != null) {
+            ProductImportDTO r = rightByEan.get(ean);
+            String rk = importRowKey(r);
+            if (r != null && rk != null && !alreadyMatchedRightKeys.contains(rk)) return new MatchResult(r, "EAN");
+        }
+        String nome = normalize(left.getNome());
+        if (nome != null) {
+            ProductImportDTO r = rightByNome.get(nome);
+            String rk = importRowKey(r);
+            if (r != null && rk != null && !alreadyMatchedRightKeys.contains(rk)) return new MatchResult(r, "NOME");
+        }
+        String key = importRowKey(left);
+        ProductImportDTO r = key != null ? rightByKey.get(key) : null;
+        String rk = importRowKey(r);
+        if (r != null && rk != null && !alreadyMatchedRightKeys.contains(rk)) return new MatchResult(r, "CHIAVE");
+        return new MatchResult(null, null);
+    }
+
+    private Map<String, Object> buildPriceDifferenceRow(ProductImportDTO left, ProductImportDTO right, String matchedBy) {
+        Map<String, Object> row = new HashMap<>();
+        Double oldPrice = left.getPrezzoBase();
+        Double newPrice = right.getPrezzoBase();
+        double delta = (newPrice != null ? newPrice : 0d) - (oldPrice != null ? oldPrice : 0d);
+        row.put("sku", normalize(left.getSku()) != null ? left.getSku() : right.getSku());
+        row.put("ean", normalize(left.getEan()) != null ? left.getEan() : right.getEan());
+        row.put("nome", normalize(left.getNome()) != null ? left.getNome() : right.getNome());
+        row.put("oldPrice", oldPrice);
+        row.put("newPrice", newPrice);
+        row.put("delta", delta);
+        row.put("direction", delta > 0 ? "AUMENTATO" : (delta < 0 ? "DIMINUITO" : "VARIATO"));
+        row.put("matchedBy", matchedBy);
+        return row;
+    }
+
+    private Map<String, Object> buildMissingRow(ProductImportDTO dto, String note) {
+        Map<String, Object> row = new HashMap<>();
+        row.put("sku", dto.getSku());
+        row.put("ean", dto.getEan());
+        row.put("nome", dto.getNome());
+        row.put("note", note);
+        return row;
+    }
+
+    private String importRowKey(ProductImportDTO dto) {
+        if (dto == null) return null;
+        String sku = normalize(dto.getSku());
+        String ean = normalize(dto.getEan());
+        String nome = normalize(dto.getNome());
+        String base = sku != null ? ("SKU:" + sku) : (ean != null ? ("EAN:" + ean) : (nome != null ? ("NOME:" + nome) : null));
+        if (base == null) return null;
+        return truncate(base, 255);
+    }
+
+    private boolean isOfferRow(ProductImportDTO dto) {
+        if (dto == null) return false;
+        String cat = normalize(dto.getNomeCategoria());
+        if (cat == null) return false;
+        String c = cat.toLowerCase();
+        return c.contains("offerta") || c.contains("offer");
+    }
+
+    private String normalizePrice(Double v) {
+        if (v == null) return null;
+        return String.format(java.util.Locale.ROOT, "%.4f", v);
     }
 }
 

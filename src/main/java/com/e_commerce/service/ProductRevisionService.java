@@ -7,6 +7,7 @@ import com.e_commerce.repository.CategoryRepository;
 import com.e_commerce.repository.ProductRevisionRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -28,7 +29,7 @@ public class ProductRevisionService {
 
     public ProductRevisionService(ProductRevisionRepository revisionRepository,
                                   CategoryRepository categoryRepository,
-                                  ProductService productService) {
+                                  @Lazy ProductService productService) {
         this.revisionRepository = revisionRepository;
         this.categoryRepository = categoryRepository;
         this.productService = productService;
@@ -80,6 +81,7 @@ public class ProductRevisionService {
     @Transactional
     public void deleteRevisionsByProductId(Long productId) {
         revisionRepository.deleteByProductId(productId);
+        revisionRepository.flush();
     }
 
     /** Cronologia modifiche globale (tutti i prodotti, ordine data decrescente). */
@@ -139,6 +141,7 @@ public class ProductRevisionService {
         dto.setMarca(p.getMarca());
         dto.setCodiceProduttore(p.getCodiceProduttore());
         dto.setPrezzoBase(p.getPrezzoBase());
+        dto.setPrezzoOfferta(p.getPrezzoOfferta());
         dto.setPrezzoFinale(p.getPrezzoFinale());
         dto.setAumentoPercentuale(p.getAumentoPercentuale());
         dto.setCategoriaId(p.getCategoria() != null ? p.getCategoria().getId() : null);
@@ -153,6 +156,7 @@ public class ProductRevisionService {
         product.setMarca(snapshot.getMarca());
         product.setCodiceProduttore(snapshot.getCodiceProduttore());
         product.setPrezzoBase(snapshot.getPrezzoBase());
+        product.setPrezzoOfferta(snapshot.getPrezzoOfferta());
         product.setPrezzoFinale(snapshot.getPrezzoFinale());
         product.setAumentoPercentuale(snapshot.getAumentoPercentuale());
         if (snapshot.getCategoriaId() != null) {
@@ -176,6 +180,7 @@ public class ProductRevisionService {
             dto.setMarca(snap.getMarca());
             dto.setCodiceProduttore(snap.getCodiceProduttore());
             dto.setPrezzoBase(snap.getPrezzoBase());
+            dto.setPrezzoOfferta(snap.getPrezzoOfferta());
             dto.setPrezzoFinale(snap.getPrezzoFinale());
             dto.setAumentoPercentuale(snap.getAumentoPercentuale());
             dto.setCategoriaId(snap.getCategoriaId());
